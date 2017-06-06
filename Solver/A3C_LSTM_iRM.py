@@ -25,8 +25,8 @@ from IRMCSP import Value
 # -- constants
 MAX_GLOBAL_T = 1e5
 
-THREADS = 8
-OPTIMIZERS = 4
+THREADS = 12
+OPTIMIZERS = 2
 THREAD_DELAY = 0.001
 
 NUM_LSTM_CELLS = 128
@@ -45,7 +45,7 @@ EPS_STOP_RANGE = [0.1, 0.01, 0.5]
 
 EPS_STEPS = MAX_GLOBAL_T
 
-MAX_STAGNATION_RANGE = range(4, 8)
+MAX_STAGNATION_RANGE = [int(x * MAX_GLOBAL_T) for x in [0.01, 0.05, 0.10, 0.20, 0.25, 0.33, 0.50]]
 
 SOLUTION_FIRST_CRITERION = "ratio"
 # SOLUTION_FIRST_CRITERION = "value"
@@ -54,14 +54,14 @@ REPORT_LEVEL = "learning"
 # REPORT_LEVEL = "episodes"
 # REPORT_LEVEL = "steps"
 
-MIN_BATCH = THREADS * N_STEP_RETURN
+MIN_BATCH = 32
 
 LR_LOW = 1e-6
-LR_HIGH = 1e-3
+LR_HIGH = 1e-5
 LR_DECAY_RATE = 0.96
-LR_DECAY_STEP = 100
+LR_DECAY_STEP = 1000
 
-CLIP_BY_NORM = 1.0
+CLIP_BY_NORM = 0
 
 BETA_1 = 0.9
 BETA_2 = 0.999
@@ -114,6 +114,33 @@ class Brain:
         self.default_graph = tf.get_default_graph()
 
         self.default_graph.finalize()  # avoid modifications
+
+        if REPORT_LEVEL == "steps" or REPORT_LEVEL == "episodes":
+            print("\nglb_t".rjust(6),
+                  "ag".rjust(4),
+                  "ag_t".rjust(5),
+                  "iter".rjust(5),
+                  "stg".rjust(4),
+                  "b_ratio".rjust(9),
+                  "b_val".rjust(5),
+                  "p_ratio".rjust(9),
+                  "p_val".rjust(5),
+                  "g_ratio".rjust(9),
+                  "g_val".rjust(5),
+                  "time".rjust(10),
+                  sep="\t")
+
+        elif REPORT_LEVEL == "learning":
+            print("\nglb_t".rjust(6),
+                  "batch".rjust(6),
+                  "queue".rjust(6),
+                  "policy".rjust(10),
+                  "value".rjust(10),
+                  "entropy".rjust(10),
+                  "total".rjust(10),
+                  "g_ratio".rjust(9),
+                  "g_val".rjust(5),
+                  sep="\t")
 
     def _build_model(self):
         input_layer = Input(STATE_SHAPE)
@@ -187,17 +214,17 @@ class Brain:
         loss_policy_weeks = - log_prob_weeks * tf.stop_gradient(advantage)
         loss_policy_days = - log_prob_days * tf.stop_gradient(advantage)
         loss_policy_slots = - log_prob_slots * tf.stop_gradient(advantage)
-        loss_policy_total = loss_policy_rooms + loss_policy_weeks + loss_policy_days + loss_policy_slots
+        loss_policy_total = tf.reduce_mean(loss_policy_rooms + loss_policy_weeks + loss_policy_days + loss_policy_slots)
 
         # minimize value error
-        loss_value = LOSS_V * tf.square(advantage)
+        loss_value = tf.reduce_mean(LOSS_V * tf.square(advantage))
 
         # maximize entropy (regularization)
         entropy_rooms = tf.reduce_sum(p_rooms * tf.log(p_rooms + 1e-10), axis=1, keep_dims=True)
         entropy_weeks = tf.reduce_sum(p_rooms * tf.log(p_rooms + 1e-10), axis=1, keep_dims=True)
         entropy_days = tf.reduce_sum(p_rooms * tf.log(p_rooms + 1e-10), axis=1, keep_dims=True)
         entropy_slots = tf.reduce_sum(p_rooms * tf.log(p_rooms + 1e-10), axis=1, keep_dims=True)
-        entropy_total = LOSS_ENTROPY * (entropy_rooms + entropy_weeks + entropy_days + entropy_slots)
+        entropy_total = tf.reduce_mean(LOSS_ENTROPY * (entropy_rooms + entropy_weeks + entropy_days + entropy_slots))
 
         loss_total = tf.reduce_mean(loss_policy_total + loss_value + entropy_total)
 
@@ -215,16 +242,21 @@ class Brain:
             grad_and_vars = [(tf.clip_by_norm(grad, CLIP_BY_NORM), var) for grad, var in grad_and_vars]
         minimize = optimizer.apply_gradients(grad_and_vars, global_step=global_step)
 
-        return state_t, rooms_t, weeks_t, days_t, slots_t, reward_t, loss_total, minimize
+        return state_t, rooms_t, weeks_t, days_t, slots_t, reward_t, loss_policy_total, loss_value, entropy_total, loss_total, minimize
 
     def optimize(self):
         if len(self.train_queue[0]) < MIN_BATCH:
             time.sleep(THREAD_DELAY)  # yield
-            return 0, 0
+            return 0, 0, 0, 0, 0, 0
 
         with self.lock_queue:
-            s, r_c, w_c, d_c, s_c, r, s_, s_mask = self.train_queue
-            self.train_queue = [[], [], [], [], [], [], [], []]
+            s, r_c, w_c, d_c, s_c, r, s_, s_mask = self.train_queue[:MIN_BATCH]
+            del self.train_queue[:MIN_BATCH]
+            if not self.train_queue:
+                self.train_queue = [[], [], [], [], [], [], [], []]
+            batch_length = len(s)
+            queue_length = len(self.train_queue[0])
+
 
         s = np.vstack(s)
         r_c = np.vstack(r_c)
@@ -235,25 +267,32 @@ class Brain:
         s_ = np.vstack(s_)
         s_mask = np.vstack(s_mask)
 
-        if len(s) > 5 * MIN_BATCH:
+        if len(self.train_queue[0]) > MIN_BATCH:
             # print("Optimizer alert! Minimizing batch of %d" % len(s))
             self.not_enough_optimizers = True
 
         v = self.predict_v(s_)
         r += GAMMA_N * v * s_mask  # set v to 0 where s_ is terminal state
 
-        state_t, rooms_t, weeks_t, days_t, slots_t, reward_t, loss_total, minimize = self.graph
-        summary, loss_total, _ = self.session.run([self.merged_summaries, loss_total, minimize], feed_dict={state_t: s,
-                                                                                    rooms_t: r_c,
-                                                                                    weeks_t: w_c,
-                                                                                    days_t: d_c,
-                                                                                    slots_t: s_c,
-                                                                                    reward_t: r})
+        state_t, rooms_t, weeks_t, days_t, slots_t, reward_t, \
+        loss_policy_total, loss_value, entropy_total, loss_total, minimize = self.graph
 
-        self.train_writer.add_summary(summary)
-        self.train_writer.flush()
+        loss_policy_total, loss_value, entropy_total, loss_total, _ = self.session.run([loss_policy_total,
+                                                                                        loss_value,
+                                                                                        entropy_total,
+                                                                                        loss_total,
+                                                                                        minimize],
+                                                                                       feed_dict={state_t: s,
+                                                                                                  rooms_t: r_c,
+                                                                                                  weeks_t: w_c,
+                                                                                                  days_t: d_c,
+                                                                                                  slots_t: s_c,
+                                                                                                  reward_t: r})
 
-        return len(s), loss_total
+        # self.train_writer.add_summary(summary)
+        # self.train_writer.flush()
+
+        return batch_length, queue_length, loss_policy_total, loss_value, entropy_total, loss_total
 
     def train_push(self, s, r_c, w_c, d_c, s_c, r, s_):
         with self.lock_queue:
@@ -299,15 +338,21 @@ class Optimizer(threading.Thread):
     def run(self):
         global global_t
         while not self.stop_signal:
-            batch_length, loss_total = self.brain.optimize()
+            batch_length, queue_length, loss_policy_total, loss_value, entropy_total, loss_total = self.brain.optimize()
             if REPORT_LEVEL == "learning":
                 if batch_length > 0:
-                    print("{}\t{}\t{}\t{}\t{}"
+                    print("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}"
                           .format(str(self.brain.global_t).rjust(6),
-                                  batch_length,
-                                  "{: .2e}".format(loss_total).replace(".", ","),
-                                  "{:.4f}".format(self.brain.saved_solutions[self.brain.global_best_solution].placed_ratio).replace(".",",").rjust(9),
-                                  str(int(self.brain.saved_solutions[self.brain.global_best_solution].pref_value)).rjust(5)))
+                              str(batch_length).rjust(6),
+                              str(queue_length).rjust(6),
+                              "{: .2e}".format(loss_policy_total).replace(".", ",").rjust(10),
+                              "{: .2e}".format(loss_value).replace(".", ",").rjust(10),
+                              "{: .2e}".format(entropy_total).replace(".", ",").rjust(10),
+                              "{: .2e}".format(loss_total).replace(".", ",").rjust(10),
+                              "{:.4f}".format(self.brain.saved_solutions[self.brain.global_best_solution].placed_ratio)
+                                  .replace(".",",").rjust(9),
+                              str(int(self.brain.saved_solutions[self.brain.global_best_solution].pref_value))
+                                  .rjust(5)))
 
     def stop(self):
         self.stop_signal = True
@@ -456,7 +501,7 @@ class Environment(threading.Thread):
 
     def runEpisode(self):
         done = False
-        self.max_stagnation = 2 ** random.choice(MAX_STAGNATION_RANGE)
+        self.max_stagnation = random.choice(MAX_STAGNATION_RANGE)
         m, s = self.current_solution.get_state()
         R = 0
 
@@ -517,22 +562,6 @@ class Environment(threading.Thread):
                 break
 
     def run(self):
-        if self.id == 0:
-            print()
-            print("glb_t".rjust(6),
-                  "ag".rjust(4),
-                  "ag_t".rjust(5),
-                  "iter".rjust(5),
-                  "stg".rjust(4),
-                  "b_ratio".rjust(9),
-                  "b_val".rjust(5),
-                  "p_ratio".rjust(9),
-                  "p_val".rjust(5),
-                  "g_ratio".rjust(9),
-                  "g_val".rjust(5),
-                  "time".rjust(10),
-                  sep="\t")
-
         while not self.stop_signal or self.brain.global_t < MAX_GLOBAL_T:
             self.runEpisode()
 
