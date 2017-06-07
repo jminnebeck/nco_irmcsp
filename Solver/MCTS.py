@@ -1,15 +1,13 @@
-class MCTS:
+class Tree:
     def __init__(self):
-        pass
+        self.root = None
 
-    def select_node(self):
-        pass
+class Node:
+    def __init__(self, parent, state):
+        self.parent = parent
+        self.children = None
+        self.state = state
 
-    def _select_node_recursive(self):
-        pass
-
-    def expand_node(self):
-        pass
 
 class AC_Network:
     def __init__(self):
