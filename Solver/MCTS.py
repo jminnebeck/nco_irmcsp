@@ -211,13 +211,15 @@ class Worker:
         global_t = sess.run(self.global_t)
         with sess.as_default(), sess.graph.as_default():
             while global_t < MAX_GLOBAL_T:
-                env = copy(self.env)
-
+                sess.run(self.update_local_ops)
                 rnn_state = self.local_AC.state_init
 
+                env = copy(self.env)
                 current_node = self.tree.root
+
                 has_selected = False
                 done = False
+                reward = 0
 
                 meeting, state = env.get_state()
                 while not has_selected:
@@ -226,10 +228,9 @@ class Worker:
 
                     env.take_action(meeting, meeting_value)
                     env.evaluate_solution()
+                    reward = env.prev_value - reward
 
                     new_meeting, new_state = env.get_state()
-                    # CHANGE!!!
-                    reward = 1
 
                     if action not in current_node.children:
                         current_node.children[action] = Node(current_node, meeting, action)
@@ -249,35 +250,30 @@ class Worker:
                 self.episode_mean_values.append(np.mean(self.episode_values))
 
                 # Update the network using the experience buffer at the end of the episode.
-                if len(self.episode_buffer) != 0:
+                if self.episode_buffer:
                     v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, sess, GAMMA, 0.0)
 
-                # Periodically save gifs of episodes, model parameters, and summary statistics.
-                if global_t % 5 == 0 and global_t != 0:
-                    # if self.name == 'worker_0' and episode_count % 25 == 0:
-                    #     time_per_step = 0.05
-                    #     images = np.array(episode_frames)
-                    #     make_gif(images, './frames/image' + str(episode_count) + '.gif',
-                    #              duration=len(images) * time_per_step, true_image=True, salience=False)
-                    if global_t % 250 == 0 and self.name == 'worker_0':
-                        saver.save(sess, self.model_path + '/model-' + str(global_t) + '.cptk')
-                        print("Saved Model")
+                # Periodically save model parameters, and summary statistics.
+                if global_t % 250 == 0 and self.name == 'worker_0':
+                    saver.save(sess, self.model_path + '/model-' + str(global_t) + '.cptk')
+                    print("Saved Model")
 
-                    mean_reward = np.mean(self.episode_rewards[-5:])
-                    mean_length = np.mean(self.episode_lengths[-5:])
-                    mean_value = np.mean(self.episode_mean_values[-5:])
-                    summary = tf.Summary()
-                    summary.value.add(tag='Perf/Reward', simple_value=float(mean_reward))
-                    summary.value.add(tag='Perf/Length', simple_value=float(mean_length))
-                    summary.value.add(tag='Perf/Value', simple_value=float(mean_value))
-                    summary.value.add(tag='Losses/Value Loss', simple_value=float(v_l))
-                    summary.value.add(tag='Losses/Policy Loss', simple_value=float(p_l))
-                    summary.value.add(tag='Losses/Entropy', simple_value=float(e_l))
-                    summary.value.add(tag='Losses/Grad Norm', simple_value=float(g_n))
-                    summary.value.add(tag='Losses/Var Norm', simple_value=float(v_n))
-                    self.summary_writer.add_summary(summary, global_t)
+                mean_reward = np.mean(self.episode_rewards[-5:])
+                mean_length = np.mean(self.episode_lengths[-5:])
+                mean_value = np.mean(self.episode_mean_values[-5:])
+                summary = tf.Summary()
+                summary.value.add(tag='Perf/Reward', simple_value=float(mean_reward))
+                summary.value.add(tag='Perf/Length', simple_value=float(mean_length))
+                summary.value.add(tag='Perf/Value', simple_value=float(mean_value))
+                summary.value.add(tag='Losses/Value Loss', simple_value=float(v_l))
+                summary.value.add(tag='Losses/Policy Loss', simple_value=float(p_l))
+                summary.value.add(tag='Losses/Entropy', simple_value=float(e_l))
+                summary.value.add(tag='Losses/Grad Norm', simple_value=float(g_n))
+                summary.value.add(tag='Losses/Var Norm', simple_value=float(v_n))
+                self.summary_writer.add_summary(summary, global_t)
 
-                    self.summary_writer.flush()
+                self.summary_writer.flush()
+
                 if self.name == 'worker_0':
                     sess.run(self.global_t.assign_add(1))
                 global_t += 1
@@ -312,39 +308,32 @@ class Worker:
             episode_buffer = []
             sess.run(self.update_local_ops)
 
-    def simulate_from_node(self, current_env, sess, coord, saver):
+    def simulate_from_node(self, sess, current_env, node):
         best_env = copy(current_env)
         global_t = sess.run(self.global_t)
 
         with sess.as_default(), sess.graph.as_default():
-            sess.run(self.update_local_ops)
-
-            d = False
-
-            m, s = current_env.get_state()
+            meeting, state = node.meeting, node.state
             rnn_state = self.local_AC.state_init
 
-            while self.episode_step_count < SIMULATION_BUDGET:
+            done = False
+            reward = 0
+
+            while not has_selected:
                 action, value, rnn_state = self.predict(sess, state, rnn_state)
-                action, meeting_value = env.action_to_value(meeting, action)
+                action, meeting_value = current_env.action_to_value(meeting, action)
 
-                env.take_action(meeting, meeting_value)
-                env.evaluate_solution()
+                current_env.take_action(meeting, meeting_value)
+                current_env.evaluate_solution()
+                reward = current_env.prev_value - reward
 
-                new_meeting, new_state = env.get_state()
-                # CHANGE!!!
-                reward = 1
-
-                if action not in current_node.children:
-                    current_node.children[action] = Node(current_node, meeting, action)
-                    has_selected = True
-
-                current_node = current_node.children[action]
+                new_meeting, new_state = current_env.get_state()
 
                 self.save_step_data(sess, state, action, reward, new_state, done, value[0, 0], rnn_state)
 
                 state = new_state
                 meeting = new_meeting
+
 
 
     def train(self, rollout, sess, gamma, bootstrap_value):
