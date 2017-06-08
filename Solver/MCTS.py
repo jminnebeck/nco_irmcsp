@@ -152,10 +152,10 @@ class AC_Network:
 
 
 class Node:
-    def __init__(self, parent, state, action):
+    def __init__(self, parent, meeting, action):
         self.parent = parent
         self.children = {}
-        self.state = state
+        self.meeting = meeting
         self.action = action
 
 
@@ -176,6 +176,10 @@ class Worker:
         self.trainer = trainer
         self.global_t = global_episodes
         self.total_steps = 0
+        self.episode_buffer = []
+        self.episode_values = []
+        self.episode_step_count = 0
+        self.episode_reward = 0
         self.episode_rewards = []
         self.episode_lengths = []
         self.episode_mean_values = []
@@ -205,161 +209,48 @@ class Worker:
         print("Starting worker " + str(self.id))
 
         global_t = sess.run(self.global_t)
-        while global_t < MAX_GLOBAL_T:
-            env = copy(self.env)
-
-            rnn_state = self.local_AC.state_init
-
-            episode_buffer = []
-            episode_values = []
-            episode_reward = 0
-            episode_step_count = 0
-
-            current_node = self.tree.root
-            has_selected = False
-            done = False
-
-            while not has_selected:
-                meeting, state = env.get_state()
-                action, value, rnn_state = self.predict(sess, state, rnn_state)
-
-                action, meeting_value = env.action_to_value(meeting, action)
-                env.take_action(meeting, meeting_value)
-                env.evaluate_solution()
-                reward = 1
-
-                new_meeting, new_state = env.get_state()
-
-                if action not in current_node.children:
-                    current_node.children[action] = Node(current_node, meeting, action)
-                    has_selected = True
-
-                current_node = current_node.children[action]
-
-                episode_buffer.append([state, action, reward, new_state, done, value[0, 0]])
-                episode_values.append(value[0, 0])
-
-                episode_reward += reward
-                state = new_state
-                episode_step_count += 1
-
-                # If the episode hasn't ended, but the experience buffer is full, then we
-                # make an update step using that experience rollout.
-                if len(episode_buffer) == BATCH_SIZE and done != True and episode_step_count != MAX_EPISODE_LENGTH - 1:
-                    # Since we don't know what the true final return is, we "bootstrap" from our current
-                    # value estimation.
-                    v1 = sess.run(self.local_AC.value,
-                                  feed_dict={self.local_AC.inputs: [state],
-                                             self.local_AC.state_in[0]: rnn_state[0],
-                                             self.local_AC.state_in[1]: rnn_state[1]})[0, 0]
-                    v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer, sess, GAMMA, v1)
-                    episode_buffer = []
-                    sess.run(self.update_local_ops)
-
-            self.simulate_from_node(copy(env), sess, coord, saver)
-
-
-    def predict(self, sess, s, rnn_state):
-        # Take an action using probabilities from policy network output.
-        a_dist, v, rnn_state = sess.run([self.local_AC.policy, self.local_AC.value, self.local_AC.state_out],
-                                        feed_dict={self.local_AC.inputs: [s],
-                                                   self.local_AC.state_in[0]: rnn_state[0],
-                                                   self.local_AC.state_in[1]: rnn_state[1]})
-        a = np.random.choice(a_dist[0], p=a_dist[0])
-        a = np.argmax(a_dist == a)
-        return a, v, rnn_state
-
-
-
-    def simulate_from_node(self, current_env, sess, coord, saver):
-        best_env = copy(current_env)
-        global_t = sess.run(self.global_t)
-
         with sess.as_default(), sess.graph.as_default():
-            while not coord.should_stop():
-                sess.run(self.update_local_ops)
-                episode_buffer = []
-                episode_values = []
-                episode_reward = 0
-                episode_step_count = 0
-                d = False
+            while global_t < MAX_GLOBAL_T:
+                env = copy(self.env)
 
-                # self.max_stagnation = choice(MAX_STAGNATION_RANGE)
-
-                m, s = current_env.get_state()
                 rnn_state = self.local_AC.state_init
 
-                while episode_step_count < SIMULATION_BUDGET:
-                    # start = datetime.datetime.now()
+                current_node = self.tree.root
+                has_selected = False
+                done = False
 
-                    # Take an action using probabilities from policy network output.
-                    a_dist, v, rnn_state = self.predict(sess, s, rnn_state)
+                meeting, state = env.get_state()
+                while not has_selected:
+                    action, value, rnn_state = self.predict(sess, state, rnn_state)
+                    action, meeting_value = env.action_to_value(meeting, action)
 
-                    a, m_v = current_env.action_to_value(m, a_dist)
+                    env.take_action(meeting, meeting_value)
+                    env.evaluate_solution()
 
-                    if m_v is None:
-                        r = -1
-                        current_env.stagnation += 1
-                    else:
-                        current_env.take_action(m, m_v)
-                        current_env.evaluate_solution()
+                    new_meeting, new_state = env.get_state()
+                    # CHANGE!!!
+                    reward = 1
 
-                        if current_env.is_better_solution(self.best_solution, SOLUTION_FIRST_CRITERION):
-                            r = 1  # self.current_solution.placed_ratio
-                            current_env.stagnation = 0
-                            self.best_solution = copy(current_env)
-                            if self.best_solution.is_better_solution(self.global_network.saved_solutions[self.id],
-                                                                     SOLUTION_FIRST_CRITERION):
-                                self.global_network.saved_solutions[self.id] = copy(self.best_solution)
-                                if self.global_network.saved_solutions[self.id].is_better_solution(
-                                        self.global_network.saved_solutions[self.global_network.global_best_solution],
-                                        SOLUTION_FIRST_CRITERION):
-                                    self.global_network.global_best_solution = self.id
-                        else:
-                            r = 0
-                            current_env.stagnation += 1
+                    if action not in current_node.children:
+                        current_node.children[action] = Node(current_node, meeting, action)
+                        has_selected = True
 
-                    d = current_env.is_stagnant(self.max_stagnation)
-                    if not d:
-                        s1 = current_env.get_state()
-                    else:
-                        s1 = s
+                    current_node = current_node.children[action]
 
-                    episode_buffer.append([s, a, r, s1, d, v[0, 0]])
-                    episode_values.append(v[0, 0])
+                    self.save_step_data(sess, state, action, reward, new_state, done, value[0, 0], rnn_state)
 
-                    episode_reward += r
-                    s = s1
-                    self.total_steps += 1
-                    episode_step_count += 1
+                    state = new_state
+                    meeting = new_meeting
 
-                    # If the episode hasn't ended, but the experience buffer is full, then we
-                    # make an update step using that experience rollout.
-                    if len(episode_buffer) == BATCH_SIZE and d != True and episode_step_count != MAX_EPISODE_LENGTH - 1:
-                        # Since we don't know what the true final return is, we "bootstrap" from our current
-                        # value estimation.
-                        v1 = sess.run(self.local_AC.value,
-                                      feed_dict={self.local_AC.inputs: [s],
-                                                 self.local_AC.state_in[0]: rnn_state[0],
-                                                 self.local_AC.state_in[1]: rnn_state[1]})[0, 0]
-                        v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer, sess, GAMMA, v1)
-                        episode_buffer = []
-                        sess.run(self.update_local_ops)
+                self.simulate_from_node(copy(env), sess, coord, saver)
 
-                    if d:
-                        # if REPORT_LEVEL == "episodes":
-                        #     self.print_episode_stats(start)
-                        break
-                # if REPORT_LEVEL == "episodes":
-                #     self.print_episode_stats(start)
-
-                self.episode_rewards.append(episode_reward)
-                self.episode_lengths.append(episode_step_count)
-                self.episode_mean_values.append(np.mean(episode_values))
+                self.episode_rewards.append(self.episode_reward)
+                self.episode_lengths.append(self.episode_step_count)
+                self.episode_mean_values.append(np.mean(self.episode_values))
 
                 # Update the network using the experience buffer at the end of the episode.
-                if len(episode_buffer) != 0:
-                    v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer, sess, GAMMA, 0.0)
+                if len(self.episode_buffer) != 0:
+                    v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, sess, GAMMA, 0.0)
 
                 # Periodically save gifs of episodes, model parameters, and summary statistics.
                 if global_t % 5 == 0 and global_t != 0:
@@ -390,6 +281,71 @@ class Worker:
                 if self.name == 'worker_0':
                     sess.run(self.global_t.assign_add(1))
                 global_t += 1
+
+    def predict(self, sess, s, rnn_state):
+        # Take an action using probabilities from policy network output.
+        a_dist, v, rnn_state = sess.run([self.local_AC.policy, self.local_AC.value, self.local_AC.state_out],
+                                        feed_dict={self.local_AC.inputs: [s],
+                                                   self.local_AC.state_in[0]: rnn_state[0],
+                                                   self.local_AC.state_in[1]: rnn_state[1]})
+        a = np.random.choice(a_dist[0], p=a_dist[0])
+        a = np.argmax(a_dist == a)
+        return a, v, rnn_state
+
+    def save_step_data(self, sess, state, action, reward, new_state, done, value, rnn_state):
+        self.episode_buffer.append([state, action, reward, new_state, done, value])
+        self.episode_values.append(value)
+
+        self.episode_reward += reward
+        self.episode_step_count += 1
+
+        # If the episode hasn't ended, but the experience buffer is full, then we
+        # make an update step using that experience rollout.
+        if len(self.episode_buffer) == BATCH_SIZE and done != True and self.episode_step_count != MAX_EPISODE_LENGTH - 1:
+            # Since we don't know what the true final return is, we "bootstrap" from our current
+            # value estimation.
+            v1 = sess.run(self.local_AC.value,
+                          feed_dict={self.local_AC.inputs: [state],
+                                     self.local_AC.state_in[0]: rnn_state[0],
+                                     self.local_AC.state_in[1]: rnn_state[1]})[0, 0]
+            v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, sess, GAMMA, v1)
+            episode_buffer = []
+            sess.run(self.update_local_ops)
+
+    def simulate_from_node(self, current_env, sess, coord, saver):
+        best_env = copy(current_env)
+        global_t = sess.run(self.global_t)
+
+        with sess.as_default(), sess.graph.as_default():
+            sess.run(self.update_local_ops)
+
+            d = False
+
+            m, s = current_env.get_state()
+            rnn_state = self.local_AC.state_init
+
+            while self.episode_step_count < SIMULATION_BUDGET:
+                action, value, rnn_state = self.predict(sess, state, rnn_state)
+                action, meeting_value = env.action_to_value(meeting, action)
+
+                env.take_action(meeting, meeting_value)
+                env.evaluate_solution()
+
+                new_meeting, new_state = env.get_state()
+                # CHANGE!!!
+                reward = 1
+
+                if action not in current_node.children:
+                    current_node.children[action] = Node(current_node, meeting, action)
+                    has_selected = True
+
+                current_node = current_node.children[action]
+
+                self.save_step_data(sess, state, action, reward, new_state, done, value[0, 0], rnn_state)
+
+                state = new_state
+                meeting = new_meeting
+
 
     def train(self, rollout, sess, gamma, bootstrap_value):
         rollout = np.array(rollout)
