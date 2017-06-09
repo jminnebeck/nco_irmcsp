@@ -16,7 +16,7 @@ GAMMA = .99  # discount rate for advantage estimation and reward discounting
 
 STATE_SIZE = None
 ACTION_SIZE = None
-DOMAIN_SHAPE = None
+STATE_SHAPE = None
 
 LSTM_SIZE = 256
 CLIP_BY_NORM = 40.0
@@ -67,7 +67,7 @@ def normalized_columns_initializer(std=1.0):
 
 class AC_Network:
     def __init__(self, domain_shape, s_size, a_size, scope, trainer):
-        global DOMAIN_SHAPE
+        global STATE_SHAPE
         global STATE_SIZE
         global ACTION_SIZE
 
@@ -173,7 +173,7 @@ class Worker:
         self.max_stagnation = 0
 
         # Create the local copy of the network and the tensorflow op to copy global paramters to local network
-        self.local_AC = AC_Network(DOMAIN_SHAPE, s_size, a_size, self.name, self.trainer)
+        self.local_AC = AC_Network(STATE_SHAPE, s_size, a_size, self.name, self.trainer)
         self.update_local_ops = update_target_graph('global', self.name)
 
         self.actions = self.actions = np.identity(a_size, dtype=bool).tolist()
@@ -441,10 +441,10 @@ class Solution:
             if m in self.placed_values:
                 meetings[m] -= 1
 
-                rooms = np.zeros((DOMAIN_SHAPE["rooms"]))
-                weeks = np.zeros((DOMAIN_SHAPE["weeks"]))
-                days = np.zeros((DOMAIN_SHAPE["days"]))
-                slots = np.zeros((DOMAIN_SHAPE["slots"]))
+                rooms = np.zeros((STATE_SHAPE["rooms"]))
+                weeks = np.zeros((STATE_SHAPE["weeks"]))
+                days = np.zeros((STATE_SHAPE["days"]))
+                slots = np.zeros((STATE_SHAPE["slots"]))
 
                 indices = self.placed_values[m].indices
 
@@ -501,7 +501,7 @@ class Solution:
             if conflict > 0:
                 self.remove_meeting(conflict)
 
-            for room in range(DOMAIN_SHAPE["rooms"]):
+            for room in range(STATE_SHAPE["rooms"]):
                 conflict = self.calendar[room, value.week, value.day, slot]
                 if conflict > 0:
                     for group in self.groups_by_meeting[meeting]:

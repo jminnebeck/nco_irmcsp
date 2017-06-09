@@ -1,3 +1,4 @@
+import datetime
 import threading
 import multiprocessing
 from random import random
@@ -15,12 +16,15 @@ from Problem.IRMCSP import Value
 MAX_GLOBAL_T = 1e5
 SIMULATION_BUDGET = 250
 
+THREADS = 1
+
 MAX_EPISODE_LENGTH = 8
 BATCH_SIZE = 32
 
-GAMMA = .99  # discount rate for advantage estimation and reward discounting
+GAMMA = 0.99  # discount rate for advantage estimation and reward discounting
+LAMBDA = 0.5
 
-LSTM_SIZE = 256
+LSTM_SIZE = 128
 CLIP_BY_NORM = 40.0
 
 LEARNING_RATE = 1e4
@@ -44,7 +48,7 @@ SOLUTION_FIRST_CRITERION = "ratio"
 
 STATE_SIZE = None
 ACTION_SIZE = None
-DOMAIN_SHAPE = None
+STATE_SHAPE = None
 
 MODEL_PATH = './model'
 
@@ -76,11 +80,11 @@ def normalized_columns_initializer(std=1.0):
 
 class AC_Network:
     def __init__(self, domain_shape, s_size, a_size, scope, trainer):
-        global DOMAIN_SHAPE
+        global STATE_SHAPE
         global STATE_SIZE
         global ACTION_SIZE
 
-        DOMAIN_SHAPE = domain_shape
+        STATE_SHAPE = domain_shape
         STATE_SIZE = s_size
         ACTION_SIZE = a_size
 
@@ -157,6 +161,10 @@ class Node:
         self.children = {}
         self.meeting = meeting
         self.action = action
+        self.visit_count = 0
+        self.prior_value = 0.0
+        self.total_reward = 0.0
+        self.mean_reward = 0.0
 
 
 class Tree:
@@ -185,25 +193,13 @@ class Worker:
         self.episode_mean_values = []
         self.summary_writer = tf.summary.FileWriter("train_" + str(self.id))
 
-        # eps_rnd = choice(range(len(EPS_START_RANGE)))
-        # self.eps_start = EPS_START_RANGE[eps_rnd]
-        # self.eps_end = EPS_STOP_RANGE[eps_rnd]
-        # self.eps_steps = EPS_STEPS
-
         # self.max_stagnation = 0
 
         # Create the local copy of the network and the tensorflow op to copy global paramters to local network
-        self.local_AC = AC_Network(DOMAIN_SHAPE, STATE_SIZE, ACTION_SIZE, self.name, self.trainer)
+        self.local_AC = AC_Network(STATE_SHAPE, STATE_SIZE, ACTION_SIZE, self.name, self.trainer)
         self.update_local_ops = update_target_graph('global', self.name)
 
         self.actions = self.actions = np.identity(ACTION_SIZE, dtype=bool).tolist()
-
-    # def getEpsilon(self):
-    #     if self.total_steps >= self.eps_steps:
-    #         return self.eps_end
-    #     else:
-    #         return self.eps_start + self.total_steps * (
-    #         self.eps_end - self.eps_start) / self.eps_steps  # linearly interpolate
 
     def work(self, sess, coord, saver):
         print("Starting worker " + str(self.id))
@@ -211,6 +207,8 @@ class Worker:
         global_t = sess.run(self.global_t)
         with sess.as_default(), sess.graph.as_default():
             while global_t < MAX_GLOBAL_T:
+                start = datetime.datetime.now()
+
                 sess.run(self.update_local_ops)
                 rnn_state = self.local_AC.state_init
 
@@ -219,35 +217,49 @@ class Worker:
 
                 has_selected = False
                 done = False
-                reward = 0
+
+                old_score = 0
+                simulation_step = 0
 
                 meeting, state = env.get_state()
-                while not has_selected:
+                while not done:
                     action, value, rnn_state = self.predict(sess, state, rnn_state)
                     action, meeting_value = env.action_to_value(meeting, action)
 
+                    if not has_selected:
+                        if (meeting, action) not in current_node.children:
+                            node_to_expand = Node(current_node, meeting, action)
+                            node_to_expand.prior_value = value
+                            current_node.children[(meeting, action)] = node_to_expand
+                            has_selected = True
+                        else:
+                            current_node.children[(meeting, action)].probability = value
+
+                            child_node_scores = self.evaluate_child_nodes(current_node)
+                            best_child_node = current_node.children[np.argmax(child_node_scores)]
+                            meeting = best_child_node.meeting
+                            action = best_child_node.action
+                        current_node = current_node.children[(meeting, action)]
+                    else:
+                        simulation_step += 1
+
                     env.take_action(meeting, meeting_value)
                     env.evaluate_solution()
-                    reward = env.prev_value - reward
+                    new_score = env.prev_value
+
+                    reward = new_score - old_score
 
                     new_meeting, new_state = env.get_state()
 
-                    if action not in current_node.children:
-                        current_node.children[action] = Node(current_node, meeting, action)
-                        has_selected = True
-
-                    current_node = current_node.children[action]
+                    done = simulation_step < SIMULATION_BUDGET
 
                     self.save_step_data(sess, state, action, reward, new_state, done, value[0, 0], rnn_state)
 
                     state = new_state
                     meeting = new_meeting
+                    old_score = new_score
 
-                self.simulate_from_node(copy(env), sess, coord, saver)
-
-                self.episode_rewards.append(self.episode_reward)
-                self.episode_lengths.append(self.episode_step_count)
-                self.episode_mean_values.append(np.mean(self.episode_values))
+                self.update_nodes(current_node, value, env.prev_value)
 
                 # Update the network using the experience buffer at the end of the episode.
                 if self.episode_buffer:
@@ -258,25 +270,37 @@ class Worker:
                     saver.save(sess, self.model_path + '/model-' + str(global_t) + '.cptk')
                     print("Saved Model")
 
-                mean_reward = np.mean(self.episode_rewards[-5:])
-                mean_length = np.mean(self.episode_lengths[-5:])
-                mean_value = np.mean(self.episode_mean_values[-5:])
-                summary = tf.Summary()
-                summary.value.add(tag='Perf/Reward', simple_value=float(mean_reward))
-                summary.value.add(tag='Perf/Length', simple_value=float(mean_length))
-                summary.value.add(tag='Perf/Value', simple_value=float(mean_value))
-                summary.value.add(tag='Losses/Value Loss', simple_value=float(v_l))
-                summary.value.add(tag='Losses/Policy Loss', simple_value=float(p_l))
-                summary.value.add(tag='Losses/Entropy', simple_value=float(e_l))
-                summary.value.add(tag='Losses/Grad Norm', simple_value=float(g_n))
-                summary.value.add(tag='Losses/Var Norm', simple_value=float(v_n))
-                self.summary_writer.add_summary(summary, global_t)
+                # self.episode_rewards.append(self.episode_reward)
+                # self.episode_lengths.append(self.episode_step_count)
+                # self.episode_mean_values.append(np.mean(self.episode_values))
+                # mean_reward = np.mean(self.episode_rewards[-5:])
+                # mean_length = np.mean(self.episode_lengths[-5:])
+                # mean_value = np.mean(self.episode_mean_values[-5:])
+                # summary = tf.Summary()
+                # summary.value.add(tag='Perf/Reward', simple_value=float(mean_reward))
+                # summary.value.add(tag='Perf/Length', simple_value=float(mean_length))
+                # summary.value.add(tag='Perf/Value', simple_value=float(mean_value))
+                # summary.value.add(tag='Losses/Value Loss', simple_value=float(v_l))
+                # summary.value.add(tag='Losses/Policy Loss', simple_value=float(p_l))
+                # summary.value.add(tag='Losses/Entropy', simple_value=float(e_l))
+                # summary.value.add(tag='Losses/Grad Norm', simple_value=float(g_n))
+                # summary.value.add(tag='Losses/Var Norm', simple_value=float(v_n))
+                # self.summary_writer.add_summary(summary, global_t)
+                # self.summary_writer.flush()
 
-                self.summary_writer.flush()
+
+                self.best_env = self.get_most_visited_path()
+                print(str(global_t).rjust(6),
+                      str(self.id).rjust(4),
+                      "{:.4f}".format(self.best_env.placed_ratio).replace(".", ",").rjust(9),
+                      str(int(self.best_env.pref_value)).rjust(5),
+                      str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
 
                 if self.name == 'worker_0':
                     sess.run(self.global_t.assign_add(1))
                 global_t += 1
+
+
 
     def predict(self, sess, s, rnn_state):
         # Take an action using probabilities from policy network output.
@@ -287,6 +311,37 @@ class Worker:
         a = np.random.choice(a_dist[0], p=a_dist[0])
         a = np.argmax(a_dist == a)
         return a, v, rnn_state
+
+    def evaluate_child_nodes(self, parent_node):
+        child_node_scores = []
+        for child_node in parent_node.children.values():
+            score = child_node.mean_reward + (child_node.probability / (1 + parent_node.visit_count))
+            child_node_scores.append(score)
+        return np.array(child_node_scores)
+
+    def update_nodes(self, leaf_node, value, reward):
+        current_node = leaf_node
+        evaluted_reward = (1 - LAMBDA) * value + LAMBDA * reward
+        while current_node.parent is not None:
+            current_node.visit_count += 1
+            current_node.total_reward += evaluted_reward
+            current_node.mean_reward = current_node.total_reward / current_node.visit_count
+            current_node = current_node.parent
+
+    def get_most_visited_path(self):
+        env = copy(self.env)
+        current_node = self.tree.root
+
+        while current_node.children:
+            visit_count = np.array([child_node.visit_count for child_node in current_node.children.values()])
+            most_visited_child_node = list(current_node.children.values())[np.argmax(visit_count)]
+            current_node = most_visited_child_node
+            _, meeting_value = env.action_to_value(current_node.meeting, current_node.action)
+            env.take_action(current_node.meeting, meeting_value)
+
+        env.evaluate_solution()
+        return env
+
 
     def save_step_data(self, sess, state, action, reward, new_state, done, value, rnn_state):
         self.episode_buffer.append([state, action, reward, new_state, done, value])
@@ -307,34 +362,6 @@ class Worker:
             v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, sess, GAMMA, v1)
             episode_buffer = []
             sess.run(self.update_local_ops)
-
-    def simulate_from_node(self, sess, current_env, node):
-        best_env = copy(current_env)
-        global_t = sess.run(self.global_t)
-
-        with sess.as_default(), sess.graph.as_default():
-            meeting, state = node.meeting, node.state
-            rnn_state = self.local_AC.state_init
-
-            done = False
-            reward = 0
-
-            while not has_selected:
-                action, value, rnn_state = self.predict(sess, state, rnn_state)
-                action, meeting_value = current_env.action_to_value(meeting, action)
-
-                current_env.take_action(meeting, meeting_value)
-                current_env.evaluate_solution()
-                reward = current_env.prev_value - reward
-
-                new_meeting, new_state = current_env.get_state()
-
-                self.save_step_data(sess, state, action, reward, new_state, done, value[0, 0], rnn_state)
-
-                state = new_state
-                meeting = new_meeting
-
-
 
     def train(self, rollout, sess, gamma, bootstrap_value):
         rollout = np.array(rollout)
@@ -425,10 +452,10 @@ class Solution:
             if m in self.placed_values:
                 meetings[m] -= 1
 
-                rooms = np.zeros((DOMAIN_SHAPE["rooms"]))
-                weeks = np.zeros((DOMAIN_SHAPE["weeks"]))
-                days = np.zeros((DOMAIN_SHAPE["days"]))
-                slots = np.zeros((DOMAIN_SHAPE["slots"]))
+                rooms = np.zeros((STATE_SHAPE["rooms"]))
+                weeks = np.zeros((STATE_SHAPE["weeks"]))
+                days = np.zeros((STATE_SHAPE["days"]))
+                slots = np.zeros((STATE_SHAPE["slots"]))
 
                 indices = self.placed_values[m].indices
 
@@ -450,34 +477,23 @@ class Solution:
         m_max_shuffle = np.where(meetings == np.max(meetings), m_random, 0)
         m = np.argmax(m_max_shuffle)
 
-        s = np.reshape(s, (1, STATE_SIZE, -1))
+        s = np.reshape(s, (1, STATE_SIZE))
 
         return m, s
 
     def action_to_value(self, m, a):
         d = self.domains_as_calendar[m]
-        eps = self.worker.getEpsilon()
 
-        if random() < eps:
+        if d[a] != 1:
             random_a = np.random.random(d.shape)
             a = np.argmax(d * random_a)
 
-        else:
-            max_a = np.max(a)
-            random_a = np.random.random(d["rooms"].shape)
-            random_max_a = np.where(a == max_a, random_a, 0)
-            a = np.argmax(random_max_a)
+        indices = self.int_to_indices[a]
 
-        if d[a] == 1:
-            indices = self.int_to_indices[a]
+        duration_in_slots = self.durations_in_slots[m]
+        m_v = Value(m, indices, duration_in_slots)
 
-            duration_in_slots = self.durations_in_slots[m]
-            m_v = Value(m, indices, duration_in_slots)
-
-        else:
-            m_v = None
-
-        return m_v
+        return a, m_v
 
     def take_action(self, meeting, value):
         for slot in range(value.start, value.end + 1):
@@ -485,7 +501,7 @@ class Solution:
             if conflict > 0:
                 self.remove_meeting(conflict)
 
-            for room in range(DOMAIN_SHAPE["rooms"]):
+            for room in range(STATE_SHAPE["rooms"]):
                 conflict = self.calendar[room, value.week, value.day, slot]
                 if conflict > 0:
                     for group in self.groups_by_meeting[meeting]:
@@ -561,8 +577,9 @@ class Solution:
 class MonteCarloTreeSearch:
     def __init__(self):
         self.tree = Tree()
+        self.saved_solutions = {}
 
-    def run(self):
+    def run(self, env):
         load_model = False
         tf.reset_default_graph()
 
@@ -577,15 +594,13 @@ class MonteCarloTreeSearch:
             global_episodes = tf.Variable(0, dtype=tf.int32, name='global_episodes', trainable=False)
             trainer = tf.train.AdamOptimizer(learning_rate=1e-4)
             master_network = AC_Network(STATE_SIZE, ACTION_SIZE, 'global', None)  # Generate global network
-            num_workers = multiprocessing.cpu_count()  # Set workers ot number of available CPU threads
             workers = []
             # Create worker classes
-            for i in range(num_workers):
+            for i in range(THREADS):
                 workers.append(Worker(i, STATE_SIZE, ACTION_SIZE, trainer, MODEL_PATH, global_episodes))
             saver = tf.train.Saver(max_to_keep=5)
 
         with tf.Session() as sess:
-            coord = tf.train.Coordinator()
             if load_model == True:
                 print('Loading Model...')
                 ckpt = tf.train.get_checkpoint_state(MODEL_PATH)
@@ -597,9 +612,13 @@ class MonteCarloTreeSearch:
             # Start the "work" process for each worker in a separate threat.
             worker_threads = []
             for worker in workers:
-                worker_work = lambda: worker.work(MAX_EPISODE_LENGTH, GAMMA, sess, coord, saver)
+                worker_work = lambda: worker.work(MAX_EPISODE_LENGTH, GAMMA, sess, saver)
                 t = threading.Thread(target=(worker_work))
                 t.start()
                 sleep(0.5)
                 worker_threads.append(t)
-            coord.join(worker_threads)
+
+        self.saved_solutions[0] = workers[0].best_env
+
+        for worker in worker_threads:
+            worker.join()
