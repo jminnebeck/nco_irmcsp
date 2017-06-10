@@ -242,23 +242,24 @@ class IRMCSP:
 
         solution.constraints = []
         for constraint in self.constraints.values():
-            for meeting in constraint.owner.meetings.values():
-                meeting_constraint = deepcopy(constraint)
-                meeting_constraint.owner = meeting.id
-                meeting_constraint.targets = []
-                for target_course in constraint.targets.values():
-                    if constraint.level == "Veranstaltung":
-                        meeting_constraint.targets += list(target_course.meetings)
-                    elif constraint.level == "Gruppe":
-                        for target_meetings in target_course.meetings.values():
-                            is_target = True
-                            for target_group in target_meetings.groups:
-                                if target_group not in meeting.groups:
-                                    is_target = False
-                                    break
-                            if is_target:
-                                meeting_constraint.targets.append(target_meetings.id)
-                solution.constraints.append(meeting_constraint)
+            if constraint.owner:
+                for meeting in constraint.owner.meetings.values():
+                    meeting_constraint = deepcopy(constraint)
+                    meeting_constraint.owner = meeting.id
+                    meeting_constraint.targets = []
+                    for target_course in constraint.targets.values():
+                        if constraint.level == "Veranstaltung":
+                            meeting_constraint.targets += list(target_course.meetings)
+                        elif constraint.level == "Gruppe":
+                            for target_meetings in target_course.meetings.values():
+                                is_target = True
+                                for target_group in target_meetings.groups:
+                                    if target_group not in meeting.groups:
+                                        is_target = False
+                                        break
+                                if is_target:
+                                    meeting_constraint.targets.append(target_meetings.id)
+                    solution.constraints.append(meeting_constraint)
 
         self.nr_meetings = solution.nr_meetings = len(self.meetings)
 

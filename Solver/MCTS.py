@@ -16,7 +16,7 @@ from Problem.IRMCSP import Value
 MAX_GLOBAL_T = 1e5
 SIMULATION_BUDGET = 250
 
-THREADS = 1
+THREADS = 8
 
 MAX_EPISODE_LENGTH = 8
 BATCH_SIZE = 32
@@ -79,12 +79,12 @@ def normalized_columns_initializer(std=1.0):
 
 
 class AC_Network:
-    def __init__(self, domain_shape, s_size, a_size, scope, trainer):
+    def __init__(self, state_shape, s_size, a_size, scope, trainer):
         global STATE_SHAPE
         global STATE_SIZE
         global ACTION_SIZE
 
-        STATE_SHAPE = domain_shape
+        STATE_SHAPE = state_shape
         STATE_SIZE = s_size
         ACTION_SIZE = a_size
 
@@ -179,6 +179,7 @@ class Worker:
         self.tree = global_tree
         self.env = env
         self.env.worker = self
+        self.best_env = None
         self.global_network = global_network
         self.model_path = model_path
         self.trainer = trainer
@@ -201,7 +202,7 @@ class Worker:
 
         self.actions = self.actions = np.identity(ACTION_SIZE, dtype=bool).tolist()
 
-    def work(self, sess, coord, saver):
+    def work(self, sess, saver):
         print("Starting worker " + str(self.id))
 
         global_t = sess.run(self.global_t)
@@ -245,7 +246,7 @@ class Worker:
 
                     env.take_action(meeting, meeting_value)
                     env.evaluate_solution()
-                    new_score = env.prev_value
+                    new_score = env.pref_value
 
                     reward = new_score - old_score
 
@@ -259,16 +260,16 @@ class Worker:
                     meeting = new_meeting
                     old_score = new_score
 
-                self.update_nodes(current_node, value, env.prev_value)
+                self.update_nodes(current_node, value, env.pref_value)
 
                 # Update the network using the experience buffer at the end of the episode.
                 if self.episode_buffer:
                     v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, sess, GAMMA, 0.0)
 
-                # Periodically save model parameters, and summary statistics.
-                if global_t % 250 == 0 and self.name == 'worker_0':
-                    saver.save(sess, self.model_path + '/model-' + str(global_t) + '.cptk')
-                    print("Saved Model")
+                # # Periodically save model parameters, and summary statistics.
+                # if global_t % 250 == 0 and self.name == 'worker_0':
+                #     saver.save(sess, self.model_path + '/model-' + str(global_t) + '.cptk')
+                #     print("Saved Model")
 
                 # self.episode_rewards.append(self.episode_reward)
                 # self.episode_lengths.append(self.episode_step_count)
@@ -300,8 +301,6 @@ class Worker:
                     sess.run(self.global_t.assign_add(1))
                 global_t += 1
 
-
-
     def predict(self, sess, s, rnn_state):
         # Take an action using probabilities from policy network output.
         a_dist, v, rnn_state = sess.run([self.local_AC.policy, self.local_AC.value, self.local_AC.state_out],
@@ -315,7 +314,7 @@ class Worker:
     def evaluate_child_nodes(self, parent_node):
         child_node_scores = []
         for child_node in parent_node.children.values():
-            score = child_node.mean_reward + (child_node.probability / (1 + parent_node.visit_count))
+            score = child_node.mean_reward + (child_node.prior_value / (1 + parent_node.visit_count))
             child_node_scores.append(score)
         return np.array(child_node_scores)
 
@@ -352,7 +351,7 @@ class Worker:
 
         # If the episode hasn't ended, but the experience buffer is full, then we
         # make an update step using that experience rollout.
-        if len(self.episode_buffer) == BATCH_SIZE and done != True and self.episode_step_count != MAX_EPISODE_LENGTH - 1:
+        if len(self.episode_buffer) == BATCH_SIZE and not done and self.episode_step_count != MAX_EPISODE_LENGTH - 1:
             # Since we don't know what the true final return is, we "bootstrap" from our current
             # value estimation.
             v1 = sess.run(self.local_AC.value,
@@ -452,10 +451,10 @@ class Solution:
             if m in self.placed_values:
                 meetings[m] -= 1
 
-                rooms = np.zeros((STATE_SHAPE["rooms"]))
-                weeks = np.zeros((STATE_SHAPE["weeks"]))
-                days = np.zeros((STATE_SHAPE["days"]))
-                slots = np.zeros((STATE_SHAPE["slots"]))
+                rooms = np.zeros((self.calendar.shape[0]))
+                weeks = np.zeros((self.calendar.shape[1]))
+                days = np.zeros((self.calendar.shape[2]))
+                slots = np.zeros((self.calendar.shape[3]))
 
                 indices = self.placed_values[m].indices
 
@@ -477,18 +476,18 @@ class Solution:
         m_max_shuffle = np.where(meetings == np.max(meetings), m_random, 0)
         m = np.argmax(m_max_shuffle)
 
-        s = np.reshape(s, (1, STATE_SIZE))
+        s = np.reshape(s, STATE_SHAPE)
 
         return m, s
 
     def action_to_value(self, m, a):
         d = self.domains_as_calendar[m]
 
-        if d[a] != 1:
+        indices = self.int_to_indices[a]
+        if d[indices] != 1:
             random_a = np.random.random(d.shape)
             a = np.argmax(d * random_a)
-
-        indices = self.int_to_indices[a]
+            indices = self.int_to_indices[a]
 
         duration_in_slots = self.durations_in_slots[m]
         m_v = Value(m, indices, duration_in_slots)
@@ -501,7 +500,7 @@ class Solution:
             if conflict > 0:
                 self.remove_meeting(conflict)
 
-            for room in range(STATE_SHAPE["rooms"]):
+            for room in range(self.calendar.shape[0]):
                 conflict = self.calendar[room, value.week, value.day, slot]
                 if conflict > 0:
                     for group in self.groups_by_meeting[meeting]:
@@ -579,7 +578,7 @@ class MonteCarloTreeSearch:
         self.tree = Tree()
         self.saved_solutions = {}
 
-    def run(self, env):
+    def run(self, env, state_shape, state_size, action_size):
         load_model = False
         tf.reset_default_graph()
 
@@ -593,11 +592,11 @@ class MonteCarloTreeSearch:
         with tf.device("/cpu:0"):
             global_episodes = tf.Variable(0, dtype=tf.int32, name='global_episodes', trainable=False)
             trainer = tf.train.AdamOptimizer(learning_rate=1e-4)
-            master_network = AC_Network(STATE_SIZE, ACTION_SIZE, 'global', None)  # Generate global network
+            master_network = AC_Network(state_shape, state_size, action_size, 'global', None)  # Generate global network
             workers = []
             # Create worker classes
             for i in range(THREADS):
-                workers.append(Worker(i, STATE_SIZE, ACTION_SIZE, trainer, MODEL_PATH, global_episodes))
+                workers.append(Worker(i, self.tree, env, master_network, trainer, MODEL_PATH, global_episodes))
             saver = tf.train.Saver(max_to_keep=5)
 
         with tf.Session() as sess:
@@ -612,13 +611,9 @@ class MonteCarloTreeSearch:
             # Start the "work" process for each worker in a separate threat.
             worker_threads = []
             for worker in workers:
-                worker_work = lambda: worker.work(MAX_EPISODE_LENGTH, GAMMA, sess, saver)
-                t = threading.Thread(target=(worker_work))
+                t = threading.Thread(target=worker.work(sess, saver))
                 t.start()
                 sleep(0.5)
                 worker_threads.append(t)
 
         self.saved_solutions[0] = workers[0].best_env
-
-        for worker in worker_threads:
-            worker.join()

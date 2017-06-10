@@ -23,20 +23,20 @@ def main():
         # pickle.dump(initial_solution, open(".\Pickle\\initial_solution.p", "wb"))
 
 
-    num_outputs = {"rooms": len(irmcsp.rooms),
-                   "weeks": irmcsp.nr_weeks,
-                   "days": irmcsp.nr_days,
-                   "slots": irmcsp.nr_slots}
 
-    state_shape = [len(irmcsp.rooms) + irmcsp.nr_weeks + irmcsp.nr_days + irmcsp.nr_slots,
-                   1,
-                   irmcsp.nr_meetings]
-
-    print("Erstelle neues Netz für A3C")
-    print("Suche bestehendes Neuronales Netz")
+    # print("Erstelle neues Netz für A3C")
+    # print("Suche bestehendes Neuronales Netz")
 
     irmcsp.current_version_note = "actors: {}, global_max_t: {}"\
                                   .format(THREADS, MAX_GLOBAL_T)
+
+    state_size = irmcsp.nr_meetings * (len(irmcsp.rooms) + irmcsp.nr_weeks + irmcsp.nr_days + irmcsp.nr_slots)
+    action_size = len(irmcsp.rooms) * irmcsp.nr_weeks * irmcsp.nr_days * irmcsp.nr_slots
+    state_shape = [state_size]
+
+    print("Starte Neuronale Monte Carlo Tree Search")
+    mcts = MonteCarloTreeSearch()
+    mcts.run(initial_solution, state_shape, state_size, action_size)
 
     if mcts.saved_solutions:
         print("Schreibe Lösungen in DB")
