@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 import scipy.signal
-from copy import copy
+from copy import copy, deepcopy
 import os
 from time import sleep
 
@@ -16,16 +16,18 @@ from Problem.IRMCSP import Value
 MAX_GLOBAL_T = 1e5
 SIMULATION_BUDGET = 250
 
-THREADS = 8
+THREADS = 1
+# THREADS = multiprocessing.cpu_count()
 
-MAX_EPISODE_LENGTH = 8
-BATCH_SIZE = 32
+LOAD_MODEL = False
+
+BATCH_SIZE = 16
 
 GAMMA = 0.99  # discount rate for advantage estimation and reward discounting
-LAMBDA = 0.5
+LAMBDA = 0.75
 
 LSTM_SIZE = 128
-CLIP_BY_NORM = 40.0
+CLIP_BY_NORM = 40
 
 LEARNING_RATE = 1e4
 
@@ -95,11 +97,17 @@ class AC_Network:
 
         with tf.variable_scope(scope):
             # Input layers
-            self.inputs = tf.placeholder(shape=[None, STATE_SIZE], dtype=tf.float32)
+            self.inputs = tf.placeholder(shape=[*STATE_SHAPE], dtype=tf.float32)
 
-            self.sequences = tf.reshape(self.inputs, shape=[-1, STATE_SIZE])
+            self.sequences = tf.reshape(self.inputs, shape=[1, STATE_SHAPE[0] * STATE_SHAPE[1], STATE_SHAPE[2] * STATE_SHAPE[3], -1])
 
-            hidden = slim.fully_connected(slim.flatten(self.sequences), LSTM_SIZE, activation_fn=tf.nn.relu)
+            self.conv1 = tf.layers.conv2d(inputs=self.sequences,
+                                          filters=LSTM_SIZE,
+                                          kernel_size=[STATE_SHAPE[0] * STATE_SHAPE[1], STATE_SHAPE[2] * STATE_SHAPE[3]],
+                                          padding="valid",
+                                          activation=tf.nn.relu)
+
+            # hidden = slim.fully_connected(slim.flatten(self.sequences), LSTM_SIZE, activation_fn=tf.nn.relu)
 
             # Recurrent network for temporal dependencies
             lstm_cell = tf.contrib.rnn.BasicLSTMCell(LSTM_SIZE, state_is_tuple=True)
@@ -109,7 +117,7 @@ class AC_Network:
             c_in = tf.placeholder(tf.float32, [1, lstm_cell.state_size.c])
             h_in = tf.placeholder(tf.float32, [1, lstm_cell.state_size.h])
             self.state_in = (c_in, h_in)
-            rnn_in = tf.expand_dims(hidden, [0])
+            rnn_in = tf.expand_dims(slim.flatten(self.conv1), [0])
             step_size = tf.shape(self.sequences)[:1]
             state_in = tf.contrib.rnn.LSTMStateTuple(c_in, h_in)
             lstm_outputs, lstm_state = tf.nn.dynamic_rnn(
@@ -172,14 +180,17 @@ class Tree:
         self.root = Node(None, None, None)
 
 
-class Worker:
-    def __init__(self, worker_id, global_tree, env, global_network, trainer, model_path, global_episodes):
+class Worker(threading.Thread):
+    def __init__(self, worker_id, global_tree, env, sess, saver, global_network, trainer, model_path, global_episodes):
+        threading.Thread.__init__(self)
         self.id = worker_id
         self.name = "worker_" + str(worker_id)
         self.tree = global_tree
         self.env = env
         self.env.worker = self
         self.best_env = None
+        self.sess = sess
+        self.saver = saver
         self.global_network = global_network
         self.model_path = model_path
         self.trainer = trainer
@@ -202,29 +213,29 @@ class Worker:
 
         self.actions = self.actions = np.identity(ACTION_SIZE, dtype=bool).tolist()
 
-    def work(self, sess, saver):
+    def run(self):
         print("Starting worker " + str(self.id))
 
-        global_t = sess.run(self.global_t)
-        with sess.as_default(), sess.graph.as_default():
+        global_t = self.sess.run(self.global_t)
+        with self.sess.as_default(), self.sess.graph.as_default():
             while global_t < MAX_GLOBAL_T:
                 start = datetime.datetime.now()
 
-                sess.run(self.update_local_ops)
+                self.sess.run(self.update_local_ops)
                 rnn_state = self.local_AC.state_init
 
                 env = copy(self.env)
                 current_node = self.tree.root
 
                 has_selected = False
+                train = True
                 done = False
 
-                old_score = 0
                 simulation_step = 0
 
                 meeting, state = env.get_state()
                 while not done:
-                    action, value, rnn_state = self.predict(sess, state, rnn_state)
+                    action, value, rnn_state = self.predict(self.sess, state, rnn_state)
                     action, meeting_value = env.action_to_value(meeting, action)
 
                     if not has_selected:
@@ -235,9 +246,7 @@ class Worker:
                             has_selected = True
                         else:
                             current_node.children[(meeting, action)].probability = value
-
-                            child_node_scores = self.evaluate_child_nodes(current_node)
-                            best_child_node = current_node.children[np.argmax(child_node_scores)]
+                            best_child_node = self.evaluate_child_nodes(current_node)
                             meeting = best_child_node.meeting
                             action = best_child_node.action
                         current_node = current_node.children[(meeting, action)]
@@ -246,30 +255,30 @@ class Worker:
 
                     env.take_action(meeting, meeting_value)
                     env.evaluate_solution()
-                    new_score = env.pref_value
 
-                    reward = new_score - old_score
+                    reward = env.pref_value
 
                     new_meeting, new_state = env.get_state()
 
                     done = simulation_step < SIMULATION_BUDGET
 
-                    self.save_step_data(sess, state, action, reward, new_state, done, value[0, 0], rnn_state)
+                    if simulation_step > 0:
+                        train = False
+                    self.save_step_data(self.sess, state, action, reward, new_state, done, value[0, 0], rnn_state, train)
 
                     state = new_state
                     meeting = new_meeting
-                    old_score = new_score
 
                 self.update_nodes(current_node, value, env.pref_value)
 
                 # Update the network using the experience buffer at the end of the episode.
                 if self.episode_buffer:
-                    v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, sess, GAMMA, 0.0)
+                    v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, self.sess, GAMMA, 0.0)
 
-                # # Periodically save model parameters, and summary statistics.
-                # if global_t % 250 == 0 and self.name == 'worker_0':
-                #     saver.save(sess, self.model_path + '/model-' + str(global_t) + '.cptk')
-                #     print("Saved Model")
+                # Periodically save model parameters, and summary statistics.
+                if global_t % 100 == 0 and self.id == 0:
+                    self.saver.save(self.sess, self.model_path + '/model-' + str(global_t) + '.cptk')
+                    print("Saved Model")
 
                 # self.episode_rewards.append(self.episode_reward)
                 # self.episode_lengths.append(self.episode_step_count)
@@ -289,17 +298,30 @@ class Worker:
                 # self.summary_writer.add_summary(summary, global_t)
                 # self.summary_writer.flush()
 
+                if self.id == 0:
+                    self.sess.run(self.global_t.assign_add(1))
 
-                self.best_env = self.get_most_visited_path()
-                print(str(global_t).rjust(6),
-                      str(self.id).rjust(4),
-                      "{:.4f}".format(self.best_env.placed_ratio).replace(".", ",").rjust(9),
-                      str(int(self.best_env.pref_value)).rjust(5),
-                      str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
+                if self.id == 0 and global_t % 10 == 0:
+                    self.best_env = self.get_most_visited_path()
+                    print(str(global_t).rjust(6),
+                          str(self.id).rjust(4),
+                          "{:.4f}".format(self.best_env.placed_ratio).replace(".", ",").rjust(9),
+                          str(int(self.best_env.pref_value)).rjust(5),
+                          "{:.4f}".format(p_l).replace(".", ",").rjust(9),
+                          "{:.4f}".format(v_l).replace(".", ",").rjust(9),
+                          "{:.4f}".format(e_l).replace(".", ",").rjust(9),
+                          "{:.4f}".format(g_n).replace(".", ",").rjust(9),
+                          "{:.4f}".format(v_n).replace(".", ",").rjust(9),
+                          str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
 
-                if self.name == 'worker_0':
-                    sess.run(self.global_t.assign_add(1))
                 global_t += 1
+
+        self.best_env = self.get_most_visited_path()
+        print(str(global_t).rjust(6),
+              str(self.id).rjust(4),
+              "{:.4f}".format(self.best_env.placed_ratio).replace(".", ",").rjust(9),
+              str(int(self.best_env.pref_value)).rjust(5),
+              str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
 
     def predict(self, sess, s, rnn_state):
         # Take an action using probabilities from policy network output.
@@ -312,18 +334,19 @@ class Worker:
         return a, v, rnn_state
 
     def evaluate_child_nodes(self, parent_node):
-        child_node_scores = []
-        for child_node in parent_node.children.values():
+        evaluated_child_nodes = []
+        for child_node in list(parent_node.children.values()):
             score = child_node.mean_reward + (child_node.prior_value / (1 + parent_node.visit_count))
-            child_node_scores.append(score)
-        return np.array(child_node_scores)
+            evaluated_child_nodes.append({"node":child_node, "score": score})
+        evaluated_child_nodes.sort(key=lambda x: x["score"], reverse=True)
+        return evaluated_child_nodes[0]["node"]
 
     def update_nodes(self, leaf_node, value, reward):
         current_node = leaf_node
-        evaluted_reward = (1 - LAMBDA) * value + LAMBDA * reward
+        evaluated_reward = (1 - LAMBDA) * value + LAMBDA * reward
         while current_node.parent is not None:
             current_node.visit_count += 1
-            current_node.total_reward += evaluted_reward
+            current_node.total_reward += evaluated_reward
             current_node.mean_reward = current_node.total_reward / current_node.visit_count
             current_node = current_node.parent
 
@@ -332,7 +355,7 @@ class Worker:
         current_node = self.tree.root
 
         while current_node.children:
-            visit_count = np.array([child_node.visit_count for child_node in current_node.children.values()])
+            visit_count = np.array([child_node.visit_count for child_node in list(current_node.children.values())])
             most_visited_child_node = list(current_node.children.values())[np.argmax(visit_count)]
             current_node = most_visited_child_node
             _, meeting_value = env.action_to_value(current_node.meeting, current_node.action)
@@ -341,17 +364,17 @@ class Worker:
         env.evaluate_solution()
         return env
 
+    def save_step_data(self, sess, state, action, reward, new_state, done, value, rnn_state, train):
+        if train:
+            self.episode_buffer.append([state, action, reward, new_state, done, value])
+            self.episode_values.append(value)
 
-    def save_step_data(self, sess, state, action, reward, new_state, done, value, rnn_state):
-        self.episode_buffer.append([state, action, reward, new_state, done, value])
-        self.episode_values.append(value)
-
-        self.episode_reward += reward
-        self.episode_step_count += 1
+            self.episode_reward += reward
+            self.episode_step_count += 1
 
         # If the episode hasn't ended, but the experience buffer is full, then we
         # make an update step using that experience rollout.
-        if len(self.episode_buffer) == BATCH_SIZE and not done and self.episode_step_count != MAX_EPISODE_LENGTH - 1:
+        if len(self.episode_buffer) == BATCH_SIZE and not done:
             # Since we don't know what the true final return is, we "bootstrap" from our current
             # value estimation.
             v1 = sess.run(self.local_AC.value,
@@ -359,7 +382,7 @@ class Worker:
                                      self.local_AC.state_in[0]: rnn_state[0],
                                      self.local_AC.state_in[1]: rnn_state[1]})[0, 0]
             v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, sess, GAMMA, v1)
-            episode_buffer = []
+            self.episode_buffer = []
             sess.run(self.update_local_ops)
 
     def train(self, rollout, sess, gamma, bootstrap_value):
@@ -443,40 +466,37 @@ class Solution:
     def get_state(self):
         meetings = np.zeros(self.nr_meetings)
 
-        s = None
+        s = np.zeros_like(self.calendar, dtype=np.float64)
         for m in range(self.nr_meetings):
-            h = np.hstack(self.domains_as_categories[m].values())
-            meetings[m] = np.sum(h) / np.size(h)
+            d = self.domains_as_calendar[m]
+            h = np.zeros_like(s, dtype=np.float64)
+            meetings[m] = np.sum(d) / np.size(d)
 
             if m in self.placed_values:
                 meetings[m] -= 1
 
-                rooms = np.zeros((self.calendar.shape[0]))
-                weeks = np.zeros((self.calendar.shape[1]))
-                days = np.zeros((self.calendar.shape[2]))
-                slots = np.zeros((self.calendar.shape[3]))
+                idx_room = self.placed_values[m].indices[0]
+                idx_week = self.placed_values[m].indices[1]
+                idx_day = self.placed_values[m].indices[2]
+                idx_slot_start = self.placed_values[m].indices[3]
+                idx_slot_end = idx_slot_start + self.durations_in_slots[m] + 1
 
-                indices = self.placed_values[m].indices
+                h[idx_room, idx_week, idx_day, idx_slot_start:idx_slot_end] = meetings[m]
 
-                rooms[indices[0]] = meetings[m]
-                weeks[indices[1]] = meetings[m]
-                days[indices[2]] = meetings[m]
-                slots[indices[3]] = meetings[m]
-
-                h = np.hstack([rooms, weeks, days, slots])
             else:
                 h[h == 1] = meetings[m]
 
-            if s is None:
-                s = h
-            else:
-                s = np.vstack((s, h))
+            s += h
 
         m_random = np.random.random(self.nr_meetings)
         m_max_shuffle = np.where(meetings == np.max(meetings), m_random, 0)
         m = np.argmax(m_max_shuffle)
 
-        s = np.reshape(s, STATE_SHAPE)
+        # s -= np.mean(s)
+        # s /= np.std(s)
+
+        if s.shape != STATE_SHAPE:
+            s = np.reshape(s, STATE_SHAPE)
 
         return m, s
 
@@ -579,7 +599,6 @@ class MonteCarloTreeSearch:
         self.saved_solutions = {}
 
     def run(self, env, state_shape, state_size, action_size):
-        load_model = False
         tf.reset_default_graph()
 
         if not os.path.exists(MODEL_PATH):
@@ -589,31 +608,26 @@ class MonteCarloTreeSearch:
         if not os.path.exists('./frames'):
             os.makedirs('./frames')
 
-        with tf.device("/cpu:0"):
+        # with tf.device("/cpu:0"):
+
+        with tf.Session() as sess:
             global_episodes = tf.Variable(0, dtype=tf.int32, name='global_episodes', trainable=False)
             trainer = tf.train.AdamOptimizer(learning_rate=1e-4)
             master_network = AC_Network(state_shape, state_size, action_size, 'global', None)  # Generate global network
-            workers = []
-            # Create worker classes
-            for i in range(THREADS):
-                workers.append(Worker(i, self.tree, env, master_network, trainer, MODEL_PATH, global_episodes))
             saver = tf.train.Saver(max_to_keep=5)
-
-        with tf.Session() as sess:
-            if load_model == True:
+            workers = [Worker(i, self.tree, deepcopy(env), sess, saver, master_network, trainer, MODEL_PATH, global_episodes)
+                       for i in range(THREADS)]
+            if LOAD_MODEL == True:
                 print('Loading Model...')
                 ckpt = tf.train.get_checkpoint_state(MODEL_PATH)
                 saver.restore(sess, ckpt.model_checkpoint_path)
             else:
                 sess.run(tf.global_variables_initializer())
 
-            # This is where the asynchronous magic happens.
-            # Start the "work" process for each worker in a separate threat.
-            worker_threads = []
             for worker in workers:
-                t = threading.Thread(target=worker.work(sess, saver))
-                t.start()
-                sleep(0.5)
-                worker_threads.append(t)
+                worker.start()
+
+            for worker in workers:
+                worker.join()
 
         self.saved_solutions[0] = workers[0].best_env

@@ -6,21 +6,23 @@ def main():
 
     print("Suche bestehende Problemdefiniton")
     try:
-        irmcsp = pickle.load(open(".\Pickle\\irmcsp.p", "rb"))
-        initial_solution = pickle.load(open(".\Pickle\\initial_solution.p", "rb"))
+        irmcsp = pickle.load(open("./Pickle/irmcsp.p", "rb"))
+        initial_solution = pickle.load(open("./Pickle/initial_solution.p", "rb"))
     except (pickle.PickleError, FileNotFoundError, EOFError):
         print("Lese neue Daten aus DB")
         irmcsp = IRMCSP(instance=1)
         initial_solution = Solution()
 
         import pypyodbc
-        conn = pypyodbc.win_connect_mdb(".\Database\BE_iRMCSP.accdb")
+        conn = pypyodbc.win_connect_mdb("./Database/BE_iRMCSP.accdb")
 
         irmcsp.read_data(conn, initial_solution)
 
-        # print("Pickele Problemdefiniton")
-        # pickle.dump(irmcsp, open(".\Pickle\\irmcsp.p", "wb"))
-        # pickle.dump(initial_solution, open(".\Pickle\\initial_solution.p", "wb"))
+        print("Pickele Problemdefiniton")
+        if not os.path.exists("./Pickle/"):
+            os.makedirs("./Pickle/")
+        pickle.dump(irmcsp, open("./Pickle/irmcsp.p", "wb"))
+        pickle.dump(initial_solution, open("./Pickle/initial_solution.p", "wb"))
 
 
 
@@ -30,9 +32,9 @@ def main():
     irmcsp.current_version_note = "actors: {}, global_max_t: {}"\
                                   .format(THREADS, MAX_GLOBAL_T)
 
-    state_size = irmcsp.nr_meetings * (len(irmcsp.rooms) + irmcsp.nr_weeks + irmcsp.nr_days + irmcsp.nr_slots)
     action_size = len(irmcsp.rooms) * irmcsp.nr_weeks * irmcsp.nr_days * irmcsp.nr_slots
-    state_shape = [state_size]
+    state_size = action_size
+    state_shape = [len(irmcsp.rooms), irmcsp.nr_weeks, irmcsp.nr_days, irmcsp.nr_slots]
 
     print("Starte Neuronale Monte Carlo Tree Search")
     mcts = MonteCarloTreeSearch()
