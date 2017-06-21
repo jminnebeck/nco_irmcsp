@@ -24,11 +24,6 @@ def main():
         pickle.dump(irmcsp, open("./Pickle/irmcsp.p", "wb"))
         pickle.dump(initial_solution, open("./Pickle/initial_solution.p", "wb"))
 
-
-
-    # print("Erstelle neues Netz für A3C")
-    # print("Suche bestehendes Neuronales Netz")
-
     irmcsp.current_version_note = "actors: {}, global_max_t: {}"\
                                   .format(THREADS, MAX_GLOBAL_T)
 
@@ -47,22 +42,10 @@ def main():
             solution.id = irmcsp.nr_saved_solutions
             conn = pypyodbc.win_connect_mdb(".\Database\BE_iRMCSP.accdb")
             irmcsp.write_solution(conn, solution)
-
-        # print("Pickele Lösungen")
-        # for solution in async_rl.saved_solutions.values():
-        #     pickle.dump(solution, open(".\Pickle\\solution_" + str(solution.id) + ".p", "wb"))
     else:
         print("Keine Lösungen übermittelt" + "\n")
 
     conn.close()
-
-    # save_net = input("Soll das Netz zur weiteren Verwendung gepickelt werden? (j/n)")
-    # if save_net == ("j"):
-    #     print("Pickele bestehendes Netz")
-    #     pickle.dump(async_rl, open(".\Pickle\\async_rl.p", "wb"))
-    # else:
-    #     print("Netz verworfen")
-
 
 if __name__ == "__main__":
     main()

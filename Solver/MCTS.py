@@ -16,18 +16,19 @@ from Problem.IRMCSP import Value
 MAX_GLOBAL_T = 1e5
 SIMULATION_BUDGET = 250
 
-THREADS = 1
-# THREADS = multiprocessing.cpu_count()
+# THREADS = 1
+THREADS = multiprocessing.cpu_count()
 
 LOAD_MODEL = False
+TRAIN_ON_PLAYOUT = True
 
 BATCH_SIZE = 16
 
 GAMMA = 0.99  # discount rate for advantage estimation and reward discounting
-LAMBDA = 0.75
+LAMBDA = 0.9
 
 LSTM_SIZE = 128
-CLIP_BY_NORM = 40
+CLIP_BY_NORM = 100
 
 LEARNING_RATE = 1e4
 
@@ -97,9 +98,9 @@ class AC_Network:
 
         with tf.variable_scope(scope):
             # Input layers
-            self.inputs = tf.placeholder(shape=[*STATE_SHAPE], dtype=tf.float32)
+            self.inputs = tf.placeholder(shape=[None, *STATE_SHAPE], dtype=tf.float32)
 
-            self.sequences = tf.reshape(self.inputs, shape=[1, STATE_SHAPE[0] * STATE_SHAPE[1], STATE_SHAPE[2] * STATE_SHAPE[3], -1])
+            self.sequences = tf.reshape(self.inputs, shape=[-1, STATE_SHAPE[0] * STATE_SHAPE[1], STATE_SHAPE[2] * STATE_SHAPE[3], 1])
 
             self.conv1 = tf.layers.conv2d(inputs=self.sequences,
                                           filters=LSTM_SIZE,
@@ -181,11 +182,12 @@ class Tree:
 
 
 class Worker(threading.Thread):
-    def __init__(self, worker_id, global_tree, env, sess, saver, global_network, trainer, model_path, global_episodes):
+    def __init__(self, worker_id, mcts, env, sess, saver, global_network, trainer, model_path, global_episodes):
         threading.Thread.__init__(self)
         self.id = worker_id
         self.name = "worker_" + str(worker_id)
-        self.tree = global_tree
+        self.mcts = mcts
+        self.tree = mcts.tree
         self.env = env
         self.env.worker = self
         self.best_env = None
@@ -216,6 +218,19 @@ class Worker(threading.Thread):
     def run(self):
         print("Starting worker " + str(self.id))
 
+        if self.id == THREADS - 1:
+            print()
+            print("t".rjust(6),
+                  "id".rjust(4),
+                  "ratio".rjust(9),
+                  "pref".rjust(5),
+                  "policy".rjust(9),
+                  "value".rjust(9),
+                  "entropy".rjust(9),
+                  "grad".rjust(9),
+                  "var".rjust(9),
+                  "time".rjust(10), sep="\t")
+
         global_t = self.sess.run(self.global_t)
         with self.sess.as_default(), self.sess.graph.as_default():
             while global_t < MAX_GLOBAL_T:
@@ -227,8 +242,8 @@ class Worker(threading.Thread):
                 env = copy(self.env)
                 current_node = self.tree.root
 
-                has_selected = False
                 train = True
+                has_selected = False
                 done = False
 
                 simulation_step = 0
@@ -236,7 +251,7 @@ class Worker(threading.Thread):
                 meeting, state = env.get_state()
                 while not done:
                     action, value, rnn_state = self.predict(self.sess, state, rnn_state)
-                    action, meeting_value = env.action_to_value(meeting, action)
+                    action = env.validate_action(meeting, action)
 
                     if not has_selected:
                         if (meeting, action) not in current_node.children:
@@ -249,36 +264,34 @@ class Worker(threading.Thread):
                             best_child_node = self.evaluate_child_nodes(current_node)
                             meeting = best_child_node.meeting
                             action = best_child_node.action
+
                         current_node = current_node.children[(meeting, action)]
                     else:
                         simulation_step += 1
 
-                    env.take_action(meeting, meeting_value)
+                    env.take_action(meeting, action)
                     env.evaluate_solution()
 
-                    reward = env.pref_value
+                    reward = env.placed_ratio
 
                     new_meeting, new_state = env.get_state()
 
-                    done = simulation_step < SIMULATION_BUDGET
+                    if simulation_step < SIMULATION_BUDGET or env.placed_ratio == 1:
+                        done = True
 
-                    if simulation_step > 0:
+                    if not TRAIN_ON_PLAYOUT and simulation_step > 0:
                         train = False
+
                     self.save_step_data(self.sess, state, action, reward, new_state, done, value[0, 0], rnn_state, train)
 
                     state = new_state
                     meeting = new_meeting
 
-                self.update_nodes(current_node, value, env.pref_value)
+                self.update_nodes(current_node, value, reward)
 
                 # Update the network using the experience buffer at the end of the episode.
                 if self.episode_buffer:
                     v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, self.sess, GAMMA, 0.0)
-
-                # Periodically save model parameters, and summary statistics.
-                if global_t % 100 == 0 and self.id == 0:
-                    self.saver.save(self.sess, self.model_path + '/model-' + str(global_t) + '.cptk')
-                    print("Saved Model")
 
                 # self.episode_rewards.append(self.episode_reward)
                 # self.episode_lengths.append(self.episode_step_count)
@@ -301,27 +314,37 @@ class Worker(threading.Thread):
                 if self.id == 0:
                     self.sess.run(self.global_t.assign_add(1))
 
-                if self.id == 0 and global_t % 10 == 0:
-                    self.best_env = self.get_most_visited_path()
-                    print(str(global_t).rjust(6),
-                          str(self.id).rjust(4),
-                          "{:.4f}".format(self.best_env.placed_ratio).replace(".", ",").rjust(9),
-                          str(int(self.best_env.pref_value)).rjust(5),
-                          "{:.4f}".format(p_l).replace(".", ",").rjust(9),
-                          "{:.4f}".format(v_l).replace(".", ",").rjust(9),
-                          "{:.4f}".format(e_l).replace(".", ",").rjust(9),
-                          "{:.4f}".format(g_n).replace(".", ",").rjust(9),
-                          "{:.4f}".format(v_n).replace(".", ",").rjust(9),
-                          str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
+                if self.id == 0:
+                    if global_t % 10 == 0:
+                        self.mcts.best_env = self.get_most_visited_path()
+                        print(str(global_t).rjust(6),
+                              str(self.id).rjust(4),
+                              "{:.4f}".format(self.mcts.best_env.placed_ratio).replace(".", ",").rjust(9),
+                              str(int(self.mcts.best_env.pref_value)).rjust(5),
+                              "{:.4f}".format(p_l).replace(".", ",").rjust(9),
+                              "{:.4f}".format(v_l).replace(".", ",").rjust(9),
+                              "{:.4f}".format(e_l).replace(".", ",").rjust(9),
+                              "{:.4f}".format(g_n).replace(".", ",").rjust(9),
+                              "{:.4f}".format(v_n).replace(".", ",").rjust(9),
+                              str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
 
+                # Periodically save model parameters, and summary statistics.
+                if global_t > 0 and global_t % 100 == 0 and self.id == 0:
+                    # self.saver.save(self.sess, self.model_path + '/model-' + str(global_t) + '.cptk')
+                    # print("Saved Model")
+                    print("t".rjust(6),
+                          "id".rjust(4),
+                          "ratio".rjust(9),
+                          "pref".rjust(5),
+                          "policy".rjust(9),
+                          "value".rjust(9),
+                          "entropy".rjust(9),
+                          "grad".rjust(9),
+                          "var".rjust(9),
+                          "time".rjust(10), sep="\t")
                 global_t += 1
 
-        self.best_env = self.get_most_visited_path()
-        print(str(global_t).rjust(6),
-              str(self.id).rjust(4),
-              "{:.4f}".format(self.best_env.placed_ratio).replace(".", ",").rjust(9),
-              str(int(self.best_env.pref_value)).rjust(5),
-              str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
+        self.mcts.best_env = self.get_most_visited_path()
 
     def predict(self, sess, s, rnn_state):
         # Take an action using probabilities from policy network output.
@@ -358,8 +381,7 @@ class Worker(threading.Thread):
             visit_count = np.array([child_node.visit_count for child_node in list(current_node.children.values())])
             most_visited_child_node = list(current_node.children.values())[np.argmax(visit_count)]
             current_node = most_visited_child_node
-            _, meeting_value = env.action_to_value(current_node.meeting, current_node.action)
-            env.take_action(current_node.meeting, meeting_value)
+            env.take_action(current_node.meeting, current_node.action)
 
         env.evaluate_solution()
         return env
@@ -388,6 +410,8 @@ class Worker(threading.Thread):
     def train(self, rollout, sess, gamma, bootstrap_value):
         rollout = np.array(rollout)
         observations = rollout[:, 0]
+        for idx in range(len(observations)):
+            observations[idx] = np.reshape(observations[idx], [1, *STATE_SHAPE])
         actions = rollout[:, 1]
         rewards = rollout[:, 2]
         next_observations = rollout[:, 3]
@@ -500,21 +524,32 @@ class Solution:
 
         return m, s
 
-    def action_to_value(self, m, a):
-        d = self.domains_as_calendar[m]
+    def validate_action(self, meeting, action):
+        domain = self.domains_as_calendar[meeting]
+        assert np.sum(domain) > 0, "Unable to validate action for meeting {}, empty domain".format(meeting)
 
-        indices = self.int_to_indices[a]
-        if d[indices] != 1:
-            random_a = np.random.random(d.shape)
-            a = np.argmax(d * random_a)
-            indices = self.int_to_indices[a]
+        if domain[self.int_to_indices[action]] == 1:
+            return action
+        else:
+            action_inc = action + 1
+            action_dec = action - 1
+            while True:
+                if action_inc < ACTION_SIZE:
+                    if domain[self.int_to_indices[action_inc]] == 1:
+                        return action_inc
+                    else:
+                        action_inc += 1
+                elif action_dec >= 0:
+                    if domain[self.int_to_indices[action_dec]] == 1:
+                        return action_dec
+                    else:
+                        action_dec -= 1
 
-        duration_in_slots = self.durations_in_slots[m]
-        m_v = Value(m, indices, duration_in_slots)
+    def take_action(self, meeting, action):
+        indices = self.int_to_indices[action]
+        duration_in_slots = self.durations_in_slots[meeting]
+        value = Value(meeting, indices, duration_in_slots)
 
-        return a, m_v
-
-    def take_action(self, meeting, value):
         for slot in range(value.start, value.end + 1):
             conflict = self.calendar[value.room, value.week, value.day, slot]
             if conflict > 0:
@@ -596,26 +631,23 @@ class Solution:
 class MonteCarloTreeSearch:
     def __init__(self):
         self.tree = Tree()
+        self.best_env = None
         self.saved_solutions = {}
 
     def run(self, env, state_shape, state_size, action_size):
+        self.best_env = env
+
         tf.reset_default_graph()
 
         if not os.path.exists(MODEL_PATH):
             os.makedirs(MODEL_PATH)
-
-        # Create a directory to save episode playback gifs to
-        if not os.path.exists('./frames'):
-            os.makedirs('./frames')
-
-        # with tf.device("/cpu:0"):
 
         with tf.Session() as sess:
             global_episodes = tf.Variable(0, dtype=tf.int32, name='global_episodes', trainable=False)
             trainer = tf.train.AdamOptimizer(learning_rate=1e-4)
             master_network = AC_Network(state_shape, state_size, action_size, 'global', None)  # Generate global network
             saver = tf.train.Saver(max_to_keep=5)
-            workers = [Worker(i, self.tree, deepcopy(env), sess, saver, master_network, trainer, MODEL_PATH, global_episodes)
+            workers = [Worker(i, self, deepcopy(env), sess, saver, master_network, trainer, MODEL_PATH, global_episodes)
                        for i in range(THREADS)]
             if LOAD_MODEL == True:
                 print('Loading Model...')
@@ -630,4 +662,4 @@ class MonteCarloTreeSearch:
             for worker in workers:
                 worker.join()
 
-        self.saved_solutions[0] = workers[0].best_env
+        self.saved_solutions[0] = self.best_env
