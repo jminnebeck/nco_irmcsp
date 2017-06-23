@@ -18,7 +18,7 @@ from Problem.IRMCSP import Value
 MAX_GLOBAL_T = 1e5
 SIMULATION_BUDGET = 250
 
-THREADS = 1
+THREADS = 4
 # THREADS = multiprocessing.cpu_count()
 
 LOAD_MODEL = False
@@ -27,10 +27,10 @@ TRAIN_ON_PLAYOUT = False
 BATCH_SIZE = 16
 
 GAMMA = 0.99  # discount rate for advantage estimation and reward discounting
-LAMBDA = 0.75
+LAMBDA = 0.9
 
 LSTM_SIZE = 128
-CLIP_BY_NORM = 5
+CLIP_BY_NORM = 40
 
 LEARNING_RATE = 1e4
 
@@ -180,11 +180,22 @@ class Node:
         self.meeting = meeting
         self.action = action
 
+        self.current_score = 0.0
         self.visit_count = 0
         self.prior_value = 0.0
         self.total_reward = 0.0
         self.mean_reward = 0.0
 
+    def __repr__(self):
+        return self.__str__()
+
+    def __str__(self):
+        return "Node: {}, Layer: {}, Visits: {}, Mean: {}, Child Nodes: {}"\
+               .format((self.meeting, self.action),
+                       self.layer,
+                       self.visit_count,
+                       self.mean_reward,
+                       len(self.child_nodes))
 
 class Tree:
     def __init__(self):
@@ -243,7 +254,6 @@ class Worker(threading.Thread):
                 self.env.reset()
                 current_node = self.tree.root
 
-                train = True
                 has_selected = False
                 done = False
 
@@ -255,27 +265,36 @@ class Worker(threading.Thread):
                     action = self.env.validate_action(meeting, action)
 
                     if not has_selected:
-                        if current_node.child_nodes:
+                        if not current_node.child_nodes:
+                            node_to_add = Node(current_node, meeting, action)
+                            node_to_add.prior_value = value[0, 0]
+
+                            self.update_tree_stats(current_node, node_to_add)
+                            current_node.child_nodes[(meeting, action)] = node_to_add
+
+                            current_node = node_to_add
+                            has_selected = True
+                        else:
+                            child_nodes = list(current_node.child_nodes.values())
                             if (meeting, action) not in current_node.child_nodes:
                                 node_to_add = Node(current_node, meeting, action)
                                 node_to_add.prior_value = value[0, 0]
-                                self.update_tree_stats(current_node, node_to_add)
-                                current_node.child_nodes[(meeting, action)] = node_to_add
+                                child_nodes.append(node_to_add)
+
+                                best_child_node = self.evaluate_nodes(child_nodes)
+                                if node_to_add is best_child_node:
+                                    self.update_tree_stats(current_node, node_to_add)
+                                    current_node.child_nodes[(meeting, action)] = node_to_add
+
                             else:
                                 node_to_update = current_node.child_nodes[(meeting, action)]
                                 node_to_update.prior_value = value[0, 0]
+                                best_child_node = self.evaluate_nodes(child_nodes)
 
-                            best_child_node = self.evaluate_child_nodes(current_node)
                             current_node = best_child_node
                             meeting = best_child_node.meeting
                             action = best_child_node.action
-                        else:
-                            node_to_add = Node(current_node, meeting, action)
-                            node_to_add.prior_value = value[0, 0]
-                            self.update_tree_stats(current_node, node_to_add)
-                            current_node.child_nodes[(meeting, action)] = node_to_add
-                            current_node = node_to_add
-                            has_selected = True
+
                     else:
                         simulation_step += 1
 
@@ -286,18 +305,27 @@ class Worker(threading.Thread):
 
                     new_meeting, new_state = self.env.get_state()
 
+                    # if self.id == 0:
+                    #     print(str(global_t).rjust(6),
+                    #           str(self.id).rjust(4),
+                    #           str(current_node.layer).rjust(4),
+                    #           str(simulation_step).rjust(4),
+                    #           str(meeting).rjust(4),
+                    #           str(action).rjust(5),
+                    #           "{:.4f}".format(self.env.placed_ratio).replace(".", ",").rjust(9),
+                    #           str(int(self.env.pref_value)).rjust(5),
+                    #           str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
+
                     if not simulation_step < SIMULATION_BUDGET or self.env.placed_ratio == 1:
                         done = True
 
                     if TRAIN_ON_PLAYOUT or simulation_step == 0:
                         self.save_step_data(self.sess, state, action, reward, new_state, done, value[0, 0], rnn_state)
 
-
                     state = new_state
                     meeting = new_meeting
 
-
-                self.update_nodes(current_node, value[0, 0], reward)
+                evaluated_reward = self.update_nodes(current_node, value[0, 0], reward)
 
                 # Update the network using the experience buffer at the end of the episode.
                 if self.episode_buffer:
@@ -327,6 +355,7 @@ class Worker(threading.Thread):
                 if self.id == 0:
                     if global_t % 10 == 0:
                         self.mcts.best_env = self.get_most_visited_path()
+                        self.print_stat_headers()
                 print(str(global_t).rjust(6),
                       str(self.id).rjust(4),
                       str(self.mcts.layer_count).rjust(5),
@@ -335,6 +364,9 @@ class Worker(threading.Thread):
                       str(self.mcts.nodes_by_layer[current_node.layer]).rjust(8),
                       "{:.4f}".format(self.mcts.best_env.placed_ratio).replace(".", ",").rjust(9),
                       str(int(self.mcts.best_env.pref_value)).rjust(5),
+                      "{:.4f}".format(value[0, 0]).replace(".", ",").rjust(9),
+                      "{:.4f}".format(reward).replace(".", ",").rjust(9),
+                      "{:.4f}".format(evaluated_reward).replace(".", ",").rjust(9),
                       "{:.4f}".format(p_l).replace(".", ",").rjust(9),
                       "{:.4f}".format(v_l).replace(".", ",").rjust(9),
                       "{:.4f}".format(e_l).replace(".", ",").rjust(9),
@@ -343,10 +375,10 @@ class Worker(threading.Thread):
                       str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
 
                 # Periodically save model parameters, and summary statistics.
-                if global_t > 0 and global_t % 100 == 0 and self.id == 0:
-                    # self.saver.save(self.sess, self.model_path + '/model-' + str(global_t) + '.cptk')
-                    # print("Saved Model")
-                    self.print_stat_headers()
+                # if global_t > 0 and global_t % 100 == 0 and self.id == 0:
+                #     self.saver.save(self.sess, self.model_path + '/model-' + str(global_t) + '.cptk')
+                #     print("Saved Model")
+
                 global_t += 1
 
         self.mcts.best_env = self.get_most_visited_path()
@@ -367,6 +399,9 @@ class Worker(threading.Thread):
               "clyrnds".rjust(8),
               "ratio".rjust(9),
               "pref".rjust(5),
+              "value".rjust(9),
+              "reward".rjust(9),
+              "evl_rew".rjust(9),
               "policy".rjust(9),
               "value".rjust(9),
               "entropy".rjust(9),
@@ -381,20 +416,18 @@ class Worker(threading.Thread):
                                                    self.local_AC.state_in[0]: rnn_state[0],
                                                    self.local_AC.state_in[1]: rnn_state[1]})
 
-        a = np.random.choice(np.where(a_dist[0] == a_dist[0].max())[0])
+        # a = np.random.choice(np.where(a_dist[0] == a_dist[0].max())[0])
 
-        # a = np.random.choice(a_dist[0], p=a_dist[0])
-        # a = np.argmax(a_dist == a)
+        a = np.random.choice(a_dist[0], p=a_dist[0])
+        a = np.argmax(a_dist == a)
 
         return a, v, rnn_state
 
-    def evaluate_child_nodes(self, parent_node):
-        evaluated_child_nodes = []
-        for child_node in list(parent_node.child_nodes.values()):
-            score = child_node.mean_reward + (child_node.prior_value / (1 + parent_node.visit_count))
-            evaluated_child_nodes.append({"node":child_node, "score": score})
-        evaluated_child_nodes.sort(key=lambda x: x["score"], reverse=True)
-        return evaluated_child_nodes[0]["node"]
+    def evaluate_nodes(self, child_nodes):
+        for child_node in child_nodes:
+            child_node.current_score = child_node.mean_reward + (child_node.prior_value / (1 + child_node.parent_node.visit_count))
+        child_nodes.sort(key=lambda x: x.current_score, reverse=True)
+        return child_nodes[0]
 
     def update_nodes(self, leaf_node, value, reward):
         current_node = leaf_node
@@ -404,6 +437,7 @@ class Worker(threading.Thread):
             current_node.total_reward += evaluated_reward
             current_node.mean_reward = current_node.total_reward / current_node.visit_count
             current_node = current_node.parent_node
+        return evaluated_reward
 
     def get_most_visited_path(self):
         self.env.reset()

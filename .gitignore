@@ -3,3 +3,5 @@
 *.xml
 *.iml
 *.pyc
+*.pyc
+Solver/__pycache__/MCTS.cpython-35.pyc
