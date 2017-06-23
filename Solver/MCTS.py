@@ -11,7 +11,7 @@ import tensorflow.contrib.slim as slim
 import scipy.signal
 from copy import copy, deepcopy
 import os
-from time import sleep
+import math
 
 from Problem.IRMCSP import Value
 
@@ -425,7 +425,10 @@ class Worker(threading.Thread):
 
     def evaluate_nodes(self, child_nodes):
         for child_node in child_nodes:
-            child_node.current_score = child_node.mean_reward + (child_node.prior_value / (1 + child_node.parent_node.visit_count))
+            if child_node.visit_count == 0:
+                child_node.current_score = 1000.0
+            else:
+                child_node.current_score = child_node.mean_reward + math.sqrt(2) * math.sqrt(math.log(child_node.parent_node.visit_count) / child_node.visit_count)
         child_nodes.sort(key=lambda x: x.current_score, reverse=True)
         return child_nodes[0]
 
