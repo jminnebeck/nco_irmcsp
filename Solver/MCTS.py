@@ -15,11 +15,14 @@ import math
 
 from Problem.IRMCSP import Value
 
+import networkx as nx
+import matplotlib.pyplot as plt
+
 MAX_GLOBAL_T = 1e5
 SIMULATION_BUDGET = 250
 
-THREADS = 4
-# THREADS = multiprocessing.cpu_count()
+# THREADS = 1
+THREADS = multiprocessing.cpu_count()
 
 LOAD_MODEL = False
 TRAIN_ON_PLAYOUT = False
@@ -267,18 +270,21 @@ class Worker(threading.Thread):
                     if not has_selected:
                         if not current_node.child_nodes:
                             node_to_add = Node(current_node, meeting, action)
-                            node_to_add.prior_value = value[0, 0]
+                            node_to_add.prior_value = max(min(value[0, 0], 1), 0)
 
                             self.update_tree_stats(current_node, node_to_add)
                             current_node.child_nodes[(meeting, action)] = node_to_add
+
+                            self.mcts.graph.add_edge(current_node, node_to_add)
 
                             current_node = node_to_add
                             has_selected = True
                         else:
                             child_nodes = list(current_node.child_nodes.values())
+
                             if (meeting, action) not in current_node.child_nodes:
                                 node_to_add = Node(current_node, meeting, action)
-                                node_to_add.prior_value = value[0, 0]
+                                node_to_add.prior_value = max(min(value[0, 0], 1), 0)
                                 child_nodes.append(node_to_add)
 
                                 best_child_node = self.evaluate_nodes(child_nodes)
@@ -286,9 +292,11 @@ class Worker(threading.Thread):
                                     self.update_tree_stats(current_node, node_to_add)
                                     current_node.child_nodes[(meeting, action)] = node_to_add
 
+                                    self.mcts.graph.add_edge(current_node, node_to_add)
+
                             else:
-                                node_to_update = current_node.child_nodes[(meeting, action)]
-                                node_to_update.prior_value = value[0, 0]
+                                # node_to_update = current_node.child_nodes[(meeting, action)]
+                                # node_to_update.prior_value = max(min(value[0, 0], 1), 0)
                                 best_child_node = self.evaluate_nodes(child_nodes)
 
                             current_node = best_child_node
@@ -353,6 +361,9 @@ class Worker(threading.Thread):
                     self.sess.run(self.global_t.assign_add(1))
 
                 if self.id == 0:
+                    nx.draw(self.mcts.graph)
+                    # plt.show()
+
                     if global_t % 10 == 0:
                         self.mcts.best_env = self.get_most_visited_path()
                         self.print_stat_headers()
@@ -364,7 +375,7 @@ class Worker(threading.Thread):
                       str(self.mcts.nodes_by_layer[current_node.layer]).rjust(8),
                       "{:.4f}".format(self.mcts.best_env.placed_ratio).replace(".", ",").rjust(9),
                       str(int(self.mcts.best_env.pref_value)).rjust(5),
-                      "{:.4f}".format(value[0, 0]).replace(".", ",").rjust(9),
+                      "{:.4f}".format(max(min(value[0, 0], 1), 0)).replace(".", ",").rjust(9),
                       "{:.4f}".format(reward).replace(".", ",").rjust(9),
                       "{:.4f}".format(evaluated_reward).replace(".", ",").rjust(9),
                       "{:.4f}".format(p_l).replace(".", ",").rjust(9),
@@ -373,6 +384,8 @@ class Worker(threading.Thread):
                       "{:.4f}".format(g_n).replace(".", ",").rjust(9),
                       "{:.4f}".format(v_n).replace(".", ",").rjust(9),
                       str(datetime.datetime.now() - start)[5:].rjust(10), sep="\t")
+
+
 
                 # Periodically save model parameters, and summary statistics.
                 # if global_t > 0 and global_t % 100 == 0 and self.id == 0:
@@ -425,15 +438,19 @@ class Worker(threading.Thread):
 
     def evaluate_nodes(self, child_nodes):
         for child_node in child_nodes:
-            if child_node.visit_count == 0:
-                child_node.current_score = 1000.0
+            if child_node.visit_count == 0 or child_node.parent_node.visit_count == 0:
+                uct = 1000
             else:
-                child_node.current_score = child_node.mean_reward + math.sqrt(2) * math.sqrt(math.log(child_node.parent_node.visit_count) / child_node.visit_count)
+                uct = math.sqrt(2) * math.sqrt(math.log(child_node.parent_node.visit_count) / child_node.visit_count)
+            prior = child_node.prior_value / (1 + child_node.parent_node.visit_count)
+            rave = 0
+            child_node.current_score = child_node.mean_reward + uct + prior + rave
         child_nodes.sort(key=lambda x: x.current_score, reverse=True)
         return child_nodes[0]
 
     def update_nodes(self, leaf_node, value, reward):
         current_node = leaf_node
+        value = max(min(value, 1), 0)
         evaluated_reward = (1 - LAMBDA) * value + LAMBDA * reward
         while current_node.parent_node is not None:
             current_node.visit_count += 1
@@ -595,25 +612,26 @@ class Solution:
         return m, s
 
     def validate_action(self, meeting, action):
-        domain = self.domains_as_calendar[meeting]
+        domain = self.domains_as_calendar[meeting].ravel()
         assert np.sum(domain) > 0, "Unable to validate action for meeting {}, empty domain".format(meeting)
 
-        if domain[self.int_to_indices[action]] == 1:
+        if domain[action] == 1:
             return action
         else:
-            action_inc = action + 1
-            action_dec = action - 1
-            while True:
-                if action_inc < ACTION_SIZE:
-                    if domain[self.int_to_indices[action_inc]] == 1:
-                        return action_inc
-                    else:
-                        action_inc += 1
-                elif action_dec >= 0:
-                    if domain[self.int_to_indices[action_dec]] == 1:
-                        return action_dec
-                    else:
-                        action_dec -= 1
+            possible_actions = np.nonzero(domain)[0]
+            earlier_actions = possible_actions[possible_actions < action]
+            later_actions = possible_actions[possible_actions > action]
+
+            if len(later_actions) == 0:
+                return earlier_actions[-1]
+            elif len(earlier_actions) == 0:
+                return later_actions[0]
+            else:
+                if (action - earlier_actions[-1]) <= (later_actions[0] - action):
+                    return earlier_actions[-1]
+                else:
+                    return later_actions[0]
+
 
     def take_action(self, meeting, action):
         indices = self.int_to_indices[action]
@@ -701,6 +719,7 @@ class Solution:
 class MonteCarloTreeSearch:
     def __init__(self):
         self.tree = Tree()
+        self.graph = nx.DiGraph()
         self.best_env = None
         self.layer_count = 0
         self.node_count = 0
