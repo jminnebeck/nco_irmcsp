@@ -1,4 +1,5 @@
 import pickle
+import pypyodbc
 from Problem.IRMCSP import *
 from Solver.MCTS import *
 
@@ -13,7 +14,6 @@ def main():
         irmcsp = IRMCSP(instance=1)
         initial_solution = Solution()
 
-        import pypyodbc
         conn = pypyodbc.win_connect_mdb("./Database/BE_iRMCSP.accdb")
 
         irmcsp.read_data(conn, initial_solution)
@@ -27,25 +27,26 @@ def main():
     irmcsp.current_version_note = "actors: {}, global_max_t: {}"\
                                   .format(THREADS, MAX_GLOBAL_T)
 
-    action_size = len(irmcsp.rooms) * irmcsp.nr_weeks * irmcsp.nr_days * irmcsp.nr_slots
-    state_size = action_size
     state_shape = [len(irmcsp.rooms), irmcsp.nr_weeks, irmcsp.nr_days, irmcsp.nr_slots]
+    state_size = len(irmcsp.rooms) * irmcsp.nr_weeks * irmcsp.nr_days * irmcsp.nr_slots
+    action_size = {"meeting": irmcsp.nr_meetings,
+                   "action": len(irmcsp.rooms) * irmcsp.nr_weeks * irmcsp.nr_days * irmcsp.nr_slots}
 
     print("Starte Neuronale Monte Carlo Tree Search")
     mcts = MonteCarloTreeSearch()
     mcts.run(initial_solution, state_shape, state_size, action_size)
 
-    if mcts.saved_solutions:
-        print("Schreibe Lösungen in DB")
-        for solution in mcts.saved_solutions.values():
-            irmcsp.nr_saved_solutions += 1
-            solution.id = irmcsp.nr_saved_solutions
-            conn = pypyodbc.win_connect_mdb(".\Database\BE_iRMCSP.accdb")
-            irmcsp.write_solution(conn, solution)
-    else:
-        print("Keine Lösungen übermittelt" + "\n")
-
-    conn.close()
+    # if mcts.saved_solutions:
+    #     print("Schreibe Lösungen in DB")
+    #     for solution in mcts.saved_solutions.values():
+    #         irmcsp.nr_saved_solutions += 1
+    #         solution.id = irmcsp.nr_saved_solutions
+    #         conn = pypyodbc.win_connect_mdb(".\Database\BE_iRMCSP.accdb")
+    #         irmcsp.write_solution(conn, solution)
+    # else:
+    #     print("Keine Lösungen übermittelt" + "\n")
+    #
+    # conn.close()
 
 if __name__ == "__main__":
     main()
