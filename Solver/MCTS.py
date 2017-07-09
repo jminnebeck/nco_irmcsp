@@ -20,7 +20,7 @@ from Problem.IRMCSP import Value
 # import matplotlib.pyplot as plt
 
 MAX_GLOBAL_T = 1e4
-SIMULATION_BUDGET = 100
+SIMULATION_BUDGET = 256
 
 # THREADS = 1
 THREADS = multiprocessing.cpu_count()
@@ -305,6 +305,7 @@ class Worker(threading.Thread):
                                     current_node = self.evaluate_nodes(list(current_node.child_nodes.values()))
                                 else:
                                     current_node = current_node.child_nodes[meeting]
+                                current_node.visit_count += 1
 
                                 if current_node.meeting is None or current_node.action is None:
                                     print()
@@ -323,6 +324,7 @@ class Worker(threading.Thread):
                                         current_node.child_nodes[meeting].prior_value = max(min(value[0, 0], 1), 0)
 
                                 current_node = self.evaluate_nodes(list(current_node.child_nodes.values()))
+                                current_node.visit_count += 1
 
                                 if current_node.meeting is None or current_node.action is None:
                                     print()
@@ -366,8 +368,10 @@ class Worker(threading.Thread):
                 # Update the network using the experience buffer at the end of the episode.
                 if self.episode_buffer:
                     v_l, p_l, e_l, g_n, v_n = self.train(self.episode_buffer, self.sess, GAMMA, 0.0)
+                else:
+                    v_l = p_l = e_l = g_n = v_n = 0
 
-                # self.episode_rewards.append(self.episode_reward)
+                    # self.episode_rewards.append(self.episode_reward)
                 # self.episode_lengths.append(self.episode_step_count)
                 # self.episode_mean_values.append(np.mean(self.episode_values))
                 # mean_reward = np.mean(self.episode_rewards[-5:])
@@ -463,7 +467,7 @@ class Worker(threading.Thread):
         for child_node in child_nodes:
             if child_node.visit_count == 0 or child_node.parent_node.visit_count == 0:
                 beta = 1
-                uct = 1
+                uct = 1000
             else:
                 if child_node.rave_visit_count == 0:
                     beta = 0
@@ -476,7 +480,7 @@ class Worker(threading.Thread):
 
             prior = child_node.prior_value / (1 + child_node.parent_node.visit_count)
 
-            child_node.current_score = (1 - beta) * child_node.mean_reward + beta * child_node.rave_mean_reward + prior + uct
+            child_node.current_score = (1 - beta) * child_node.mean_reward + beta * child_node.rave_mean_reward + prior # + uct
 
         child_nodes.sort(key=lambda x: x.current_score, reverse=True)
         return child_nodes[0]
@@ -487,7 +491,6 @@ class Worker(threading.Thread):
 
         current_node = leaf_node
         while current_node.parent_node is not None:
-            current_node.visit_count += 1
             current_node.total_reward += evaluated_reward
             current_node.mean_reward = current_node.total_reward / current_node.visit_count
             current_node = current_node.parent_node
