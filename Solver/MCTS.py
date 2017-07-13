@@ -202,11 +202,10 @@ class Node:
         return self.__str__()
 
     def __str__(self):
-        return "Node: {}, Layer: {}, Visits: {}, Mean: {}, Child Nodes: {}"\
+        return "Node: {}, Layer: {}, Score: {}, Child Nodes: {}"\
                .format((self.meeting, self.action),
                        self.layer,
-                       self.visit_count,
-                       self.mean_reward,
+                       self.current_score,
                        len(self.child_nodes))
 
 class Tree:
@@ -274,7 +273,7 @@ class Worker(threading.Thread):
                     meeting, action = self.env.validate_prediction(m_dist, a_dist)
 
                     if not has_selected:
-                        with self.mcts.lock:
+                        # with self.mcts.lock:
                             if not current_node.child_nodes:
                                 expansion = "{}_{}".format(current_node.layer, current_node.meeting)
                                 if current_node.parent_node is None:
@@ -463,7 +462,7 @@ class Worker(threading.Thread):
         for child_node in child_nodes:
             if child_node.visit_count == 0 or child_node.parent_node.visit_count == 0:
                 beta = 1
-                uct = 1
+                uct = 100
             else:
                 if child_node.rave_visit_count == 0:
                     beta = 0
@@ -486,11 +485,10 @@ class Worker(threading.Thread):
         evaluated_reward = (1 - LAMBDA) * value + LAMBDA * reward
 
         current_node = leaf_node
-        while current_node.parent_node is not None:
+        while current_node is not None:
             current_node.visit_count += 1
             current_node.total_reward += evaluated_reward
             current_node.mean_reward = current_node.total_reward / current_node.visit_count
-            current_node = current_node.parent_node
 
             if current_node.parent_node is not None:
                 for sibling_node in list(current_node.parent_node.child_nodes.values()):
@@ -499,6 +497,8 @@ class Worker(threading.Thread):
                             sibling_node.rave_visit_count += 1
                             sibling_node.rave_total_reward += evaluated_reward
                             sibling_node.rave_mean_reward = sibling_node.rave_total_reward / sibling_node.rave_visit_count
+
+            current_node = current_node.parent_node
 
         return evaluated_reward
 
